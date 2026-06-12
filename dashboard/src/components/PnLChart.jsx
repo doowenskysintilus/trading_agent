@@ -16,6 +16,9 @@ export default function PnLChart({ data }) {
   const maxEq   = Math.max(...equity)
   const yPad    = (maxEq - minEq) * 0.05 || 100
   const yDomain = [minEq - yPad, maxEq + yPad]
+  // Span of the visible window — drives how many decimals the axis labels
+  // need so small moves (e.g. 9.7K → 10.0K) are not all rounded to "$10K".
+  const ySpan   = (yDomain[1] - yDomain[0]) || 1
 
   // Reference line at the starting equity
   const startEquity = equity[0]
@@ -55,8 +58,9 @@ export default function PnLChart({ data }) {
           tick={{ fill: 'var(--text-dim)', fontSize: 10, fontFamily: 'var(--font)' }}
           axisLine={false}
           tickLine={false}
-          tickFormatter={(v) => `$${(v / 1000).toFixed(0)}K`}
-          width={52}
+          tickFormatter={(v) => fmtMoney(v, ySpan)}
+          width={62}
+          allowDecimals
         />
 
         <Tooltip content={<CustomTooltip startEquity={startEquity} />} />
@@ -121,6 +125,22 @@ function CustomTooltip({ active, payload, startEquity }) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// Adaptive currency formatter. Picks the number of decimals from the visible
+// span so small equity moves are still distinguishable on the axis (e.g. a
+// ~10K balance moving by a few hundred no longer collapses to "$10K").
+function fmtMoney(v, span = 0) {
+  const abs = Math.abs(v)
+  if (abs >= 1_000_000) {
+    const dec = span < 2_000_000 ? 2 : 1
+    return `$${(v / 1_000_000).toFixed(dec)}M`
+  }
+  if (abs >= 1_000) {
+    const dec = span < 2_000 ? 2 : span < 20_000 ? 1 : 0
+    return `$${(v / 1_000).toFixed(dec)}K`
+  }
+  return `$${v.toFixed(span < 50 ? 2 : 0)}`
+}
 
 function fmtTime(ts) {
   try {

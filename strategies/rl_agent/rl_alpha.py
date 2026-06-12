@@ -155,7 +155,7 @@ class RLAlpha(AlphaModel):
         else:
             action, _ = self._model.predict(obs, deterministic=self.deterministic)
 
-        action     = int(action)
+        action     = int(np.asarray(action).reshape(-1)[0])
         signal     = _ACTION_TO_SIGNAL.get(action, SignalType.HOLD)
         confidence = self._action_confidence(obs, action)
 

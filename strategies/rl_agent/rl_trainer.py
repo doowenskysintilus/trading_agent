@@ -78,6 +78,14 @@ try:
 except ImportError:
     _SB3_CONTRIB_AVAILABLE = False
 
+# TensorBoard is optional: SB3 raises ImportError at training time if a
+# tensorboard_log directory is set but the package is missing.
+try:
+    import tensorboard  # noqa: F401
+    _TENSORBOARD_AVAILABLE = True
+except ImportError:
+    _TENSORBOARD_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Reward configuration
@@ -361,10 +369,19 @@ class RLTrainerConfig:
     n_eval_episodes: int     = 5
     checkpoint_freq: int     = 50_000
 
+    # ---- Resume / warm-start --------------------------------------------
+    # When True, train() continues from the last saved model (if present)
+    # instead of starting from scratch, so stopping and relaunching keeps the
+    # knowledge acquired in previous runs and the timestep counter accumulates.
+    warm_start: bool = True
+
     # ---- I/O -----------------------------------------------------------
     model_dir: str   = "data/storage/models"
     model_name: str  = "ppo_lstm_trading"
     log_dir: str     = "data/storage/logs"
+    # Append-only reward progress (one line per episode) so the dashboard can
+    # plot the reward curve in real time. Cumulative across warm-started runs.
+    progress_path: str = "data/storage/logs/rl_progress.jsonl"
     verbose: int     = 1
 
 
@@ -373,24 +390,52 @@ class RLTrainerConfig:
 # ---------------------------------------------------------------------------
 
 class RewardTrackingCallback(BaseCallback if _SB3_AVAILABLE else object):
-    """Logs episode rewards and updates PerformanceWeighter."""
+    """Logs episode rewards and streams reward progress to a JSONL file.
 
-    def __init__(self, verbose: int = 0) -> None:
+    Each completed episode appends one line {ts, timestep, episode,
+    last_reward, mean_reward_10} so the dashboard can plot the reward curve
+    in real time and confirm the reward trends upward over training.
+    """
+
+    def __init__(self, verbose: int = 0, progress_path: str | None = None) -> None:
         if _SB3_AVAILABLE:
             super().__init__(verbose)
         self.episode_rewards: list[float] = []
         self._ep_reward = 0.0
+        self._progress_path = Path(progress_path) if progress_path else None
+        if self._progress_path is not None:
+            self._progress_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _write_progress(self, last_reward: float, mean_reward: float) -> None:
+        if self._progress_path is None:
+            return
+        import json
+        from datetime import datetime, timezone
+        record = {
+            "ts":          datetime.now(timezone.utc).isoformat(),
+            "timestep":    int(getattr(self, "num_timesteps", 0)),
+            "episode":     len(self.episode_rewards),
+            "last_reward": round(float(last_reward), 6),
+            "mean_reward": round(float(mean_reward), 6),
+        }
+        try:
+            with self._progress_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError as exc:
+            logger.debug("RL progress write failed: %s", exc)
 
     def _on_step(self) -> bool:
         self._ep_reward += float(self.locals["rewards"][0])
         if self.locals["dones"][0]:
             self.episode_rewards.append(self._ep_reward)
+            recent = self.episode_rewards[-10:]
+            mean_recent = float(np.mean(recent))
+            self._write_progress(self.episode_rewards[-1], mean_recent)
             if self.verbose >= 1 and len(self.episode_rewards) % 10 == 0:
-                recent = self.episode_rewards[-10:]
                 logger.info(
                     "Episode %d | mean_reward=%.4f | last=%.4f",
                     len(self.episode_rewards),
-                    np.mean(recent),
+                    mean_recent,
                     self.episode_rewards[-1],
                 )
             self._ep_reward = 0.0
@@ -535,7 +580,7 @@ class RLTrainer:
             max_grad_norm      = cfg.max_grad_norm,
             normalize_advantage= cfg.normalize_advantage,
             policy_kwargs      = policy_kwargs,
-            tensorboard_log    = cfg.log_dir,
+            tensorboard_log    = cfg.log_dir if _TENSORBOARD_AVAILABLE else None,
             verbose            = cfg.verbose,
         )
 
@@ -570,7 +615,27 @@ class RLTrainer:
         self._train_env = train_env
         self._val_env   = val_env
 
-        self.model = self._build_model(train_env)
+        # Warm-start: resume from the last saved model so a stop/relaunch keeps
+        # the knowledge from previous runs instead of training from scratch.
+        resumed = False
+        model_path = Path(cfg.model_dir) / f"{cfg.model_name}.zip"
+        if cfg.warm_start and model_path.exists():
+            try:
+                AlgoClass = RecurrentPPO if (cfg.use_recurrent_ppo and _SB3_CONTRIB_AVAILABLE) else PPO
+                self.model = AlgoClass.load(str(model_path), env=train_env)
+                resumed = True
+                logger.info(
+                    "Warm-start — resumed from %s (%d timesteps so far)",
+                    model_path, getattr(self.model, "num_timesteps", 0),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Warm-start failed (%s) — training a fresh model.", exc,
+                )
+                self.model = None
+
+        if self.model is None:
+            self.model = self._build_model(train_env)
 
         callbacks = CallbackList([
             EvalCallback(
@@ -588,16 +653,20 @@ class RLTrainer:
                 name_prefix  = cfg.model_name,
                 verbose      = cfg.verbose,
             ),
-            RewardTrackingCallback(verbose=cfg.verbose),
+            RewardTrackingCallback(verbose=cfg.verbose, progress_path=cfg.progress_path),
         ])
 
-        logger.info("Training started — total_timesteps=%d", cfg.total_timesteps)
+        logger.info("Training started — total_timesteps=%d (resumed=%s)",
+                    cfg.total_timesteps, resumed)
         self.model.learn(
             total_timesteps = cfg.total_timesteps,
             callback        = callbacks,
-            reset_num_timesteps = True,
+            reset_num_timesteps = not resumed,
         )
         logger.info("Training complete.")
+        # Persist the up-to-date model so the next run can resume from it
+        # and live inference (RLAlpha) picks up the latest weights.
+        self.save()
         return self
 
     # ------------------------------------------------------------------

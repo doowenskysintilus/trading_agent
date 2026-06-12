@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 
 _SUCCESS_CODES  = {10009}                   # TRADE_RETCODE_DONE
 _REQUOTE_CODES  = {10004, 10020}            # REQUOTE, PRICE_CHANGED
+_INVALID_FILL   = 10030                     # TRADE_RETCODE_INVALID_FILL
 _REJECT_CODES   = {10006, 10007, 10014,     # REJECT, CANCEL, INVALID_VOLUME
                    10017, 10018, 10019}     # MARKET_CLOSED, NO_MONEY, etc.
 
@@ -93,7 +94,7 @@ class ExecutionConfig:
     magic_number: int         = 20260524  # unique EA identifier
     comment: str              = "quant-fund-ai"
     deviation_points: int     = 20        # max slippage in points
-    filling_mode: int         = 2         # ORDER_FILLING_IOC (broker-dependent)
+    filling_mode: int         = -1        # -1 = auto-detect per symbol (broker-dependent)
 
     # Retry
     max_retries: int          = 3
@@ -264,6 +265,7 @@ class MT5ExecutionEngine:
         self.config   = config or ExecutionConfig()
         self.trailing = TrailingStopManager(self.config)
         self._connected = False
+        self._filling_cache: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Connection
@@ -379,7 +381,7 @@ class MT5ExecutionEngine:
             "magic":      self.config.magic_number,
             "comment":    self.config.comment,
             "type_time":  mt5.ORDER_TIME_GTC,
-            "type_filling": self.config.filling_mode,
+            "type_filling": self._resolve_filling_mode(trade.symbol),
         }
 
         # ---- Send with retry --------------------------------------------
@@ -428,7 +430,7 @@ class MT5ExecutionEngine:
             "magic":        self.config.magic_number,
             "comment":      f"close:{self.config.comment}",
             "type_time":    mt5.ORDER_TIME_GTC,
-            "type_filling": self.config.filling_mode,
+            "type_filling": self._resolve_filling_mode(symbol),
         }
 
         result = self._send_with_retry(request, price)
@@ -525,27 +527,135 @@ class MT5ExecutionEngine:
             "currency": info.currency,
         }
 
+    def get_closed_pnl(self, position_ticket: int) -> Optional[dict]:
+        """Realized result of a closed position from MT5 deal history.
+
+        Returns {"pnl": net_pnl, "exit_price": price} where net_pnl sums
+        profit + swap + commission across all deals of the position, or None
+        if the position id has no history yet (still open / not found).
+        """
+        if not self._connected or not _MT5_AVAILABLE:
+            return None
+        deals = mt5.history_deals_get(position=position_ticket)
+        if not deals:
+            return None
+        pnl        = 0.0
+        exit_price = 0.0
+        for d in deals:
+            pnl += d.profit + getattr(d, "swap", 0.0) + getattr(d, "commission", 0.0)
+            # DEAL_ENTRY_OUT == 1 marks the closing deal.
+            if getattr(d, "entry", None) == 1:
+                exit_price = d.price
+        return {"pnl": pnl, "exit_price": exit_price}
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _resolve_filling_mode(self, symbol: str) -> int:
+        """Return the correct ORDER_FILLING_* constant for a symbol.
+
+        Brokers only accept specific filling modes per symbol (exposed as a
+        bitmask in symbol_info().filling_mode). A hardcoded mode triggers
+        retcode 10030 (INVALID_FILL). When config.filling_mode is >= 0 it is
+        used as an explicit override; otherwise we auto-detect.
+        """
+        if self.config.filling_mode >= 0:
+            return self.config.filling_mode
+
+        cached = self._filling_cache.get(symbol)
+        if cached is not None:
+            return cached
+
+        # symbol_info().filling_mode bitmask: bit0 = FOK (1), bit1 = IOC (2).
+        info = mt5.symbol_info(symbol)
+        allowed = getattr(info, "filling_mode", 0) if info else 0
+        if allowed & 2:        # SYMBOL_FILLING_IOC
+            mode = mt5.ORDER_FILLING_IOC
+        elif allowed & 1:      # SYMBOL_FILLING_FOK
+            mode = mt5.ORDER_FILLING_FOK
+        else:                  # neither flagged → broker uses RETURN
+            mode = mt5.ORDER_FILLING_RETURN
+
+        self._filling_cache[symbol] = mode
+        return mode
+
+    def _filling_fallbacks(self, current: int) -> list[int]:
+        """Other filling modes to try if `current` is rejected (10030)."""
+        order = [
+            mt5.ORDER_FILLING_IOC,
+            mt5.ORDER_FILLING_FOK,
+            mt5.ORDER_FILLING_RETURN,
+        ]
+        return [m for m in order if m != current]
+
     def _preflight(self, trade: TradeOrder) -> Optional[ExecutionResult]:
         """Return an error ExecutionResult if any pre-check fails, else None."""
+        # --- Terminal-level: is the AutoTrading button enabled? -----------
+        term = mt5.terminal_info()
+        if term is not None and not getattr(term, "trade_allowed", True):
+            return ExecutionResult(
+                status=ExecutionStatus.REJECTED,
+                message=("AutoTrading is disabled in the MT5 terminal. "
+                         "Click the 'Algo Trading' button (toolbar) to enable it."),
+            )
+
+        # --- Account-level: is trading allowed for this account? ----------
+        acct = mt5.account_info()
+        if acct is None:
+            return ExecutionResult(
+                status=ExecutionStatus.REJECTED,
+                message="Account info unavailable — MT5 not logged in.",
+            )
+        if not getattr(acct, "trade_allowed", True):
+            return ExecutionResult(
+                status=ExecutionStatus.REJECTED,
+                message=("Trading not allowed on this account (market closed, "
+                         "investor password, or account restricted)."),
+            )
+        if not getattr(acct, "trade_expert", True):
+            return ExecutionResult(
+                status=ExecutionStatus.REJECTED,
+                message=("Automated/expert trading is disabled for this account "
+                         "(broker setting)."),
+            )
+
+        # --- Symbol-level: trade mode --------------------------------------
         info = mt5.symbol_info(trade.symbol)
         if info is None:
             return ExecutionResult(
                 status=ExecutionStatus.ERROR,
                 message=f"Symbol '{trade.symbol}' not found in MT5.",
             )
+        # Ensure the symbol is selected in Market Watch (some brokers disable
+        # quotes/trading until the symbol is shown).
+        if not getattr(info, "visible", True):
+            mt5.symbol_select(trade.symbol, True)
+            info = mt5.symbol_info(trade.symbol) or info
 
-        if not info.trade_mode:
+        # SYMBOL_TRADE_MODE: 0 DISABLED, 1 LONGONLY, 2 SHORTONLY,
+        #                    3 CLOSEONLY, 4 FULL.
+        mode = getattr(info, "trade_mode", 4)
+        mode_names = {0: "DISABLED", 1: "LONG_ONLY", 2: "SHORT_ONLY",
+                      3: "CLOSE_ONLY", 4: "FULL"}
+        if mode in (0, 3):
             return ExecutionResult(
                 status=ExecutionStatus.REJECTED,
-                message=f"Trading disabled for {trade.symbol}.",
+                message=(f"Trading disabled for {trade.symbol} "
+                         f"(trade_mode={mode_names.get(mode, mode)})."),
+            )
+        if mode == 1 and trade.direction < 0:
+            return ExecutionResult(
+                status=ExecutionStatus.REJECTED,
+                message=f"{trade.symbol} is LONG_ONLY — short orders are rejected.",
+            )
+        if mode == 2 and trade.direction > 0:
+            return ExecutionResult(
+                status=ExecutionStatus.REJECTED,
+                message=f"{trade.symbol} is SHORT_ONLY — long orders are rejected.",
             )
 
-        acct = mt5.account_info()
-        if acct is None or acct.free_margin <= 0:
+        if acct.margin_free <= 0:
             return ExecutionResult(
                 status=ExecutionStatus.REJECTED,
                 message="Insufficient free margin.",
@@ -632,6 +742,22 @@ class MT5ExecutionEngine:
                 logger.debug("Requote on attempt %d — retrying at %.5f", attempt, request["price"])
                 time.sleep(cfg.retry_delay_s)
                 continue
+
+            # ---- Invalid fill — try the other filling modes -------------
+            if retcode == _INVALID_FILL and attempt < max_att - 1:
+                current = request.get("type_filling")
+                fallbacks = self._filling_fallbacks(current)
+                if fallbacks:
+                    next_mode = fallbacks[0]
+                    # Cache the working mode so future orders skip the retry.
+                    self._filling_cache[request["symbol"]] = next_mode
+                    request["type_filling"] = next_mode
+                    retries += 1
+                    logger.warning(
+                        "Invalid fill mode %s for %s — retrying with %s",
+                        current, request["symbol"], next_mode,
+                    )
+                    continue
 
             # ---- Hard reject — do not retry ----------------------------
             if retcode in _REJECT_CODES:

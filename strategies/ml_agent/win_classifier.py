@@ -1,0 +1,175 @@
+"""
+WinClassifier
+=============
+Supervised win/loss model that learns *directly from the system's own
+trading results*. It maps the entry observation (the same features the
+strategies see) to the probability that a trade will be profitable.
+
+Used in parallel with the RL agent as a confidence filter: trades whose
+predicted win-probability is too low can be skipped or down-weighted.
+
+Backed by scikit-learn (GradientBoostingClassifier). Persisted with joblib.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+try:
+    import joblib
+    from sklearn.ensemble import GradientBoostingClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import accuracy_score, roc_auc_score
+    _SKLEARN_OK = True
+except ImportError:
+    _SKLEARN_OK = False
+
+
+@dataclass
+class TrainReport:
+    """Summary of a training run, returned to the API/dashboard."""
+
+    trained:      bool          = False
+    n_samples:    int           = 0
+    n_wins:       int           = 0
+    n_losses:     int           = 0
+    accuracy:     float         = 0.0
+    auc:          float         = 0.0
+    feature_names: list[str]    = field(default_factory=list)
+    message:      str           = ""
+
+    def as_dict(self) -> dict:
+        return {
+            "trained":       self.trained,
+            "n_samples":     self.n_samples,
+            "n_wins":        self.n_wins,
+            "n_losses":      self.n_losses,
+            "accuracy":      round(self.accuracy, 4),
+            "auc":           round(self.auc, 4),
+            "n_features":    len(self.feature_names),
+            "message":       self.message,
+        }
+
+
+class WinClassifier:
+    """Predicts P(win) from a trade's entry features."""
+
+    def __init__(self, model_path: str = "data/storage/models/win_classifier.joblib") -> None:
+        self.model_path     = Path(model_path)
+        self._model         = None
+        self._feature_names: list[str] = []
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    def train(self, X, y, feature_names: list[str], min_samples: int = 30) -> TrainReport:
+        """Fit the classifier on (features → win) data.
+
+        Requires at least ``min_samples`` trades and both classes present;
+        otherwise returns an untrained report explaining why.
+        """
+        if not _SKLEARN_OK:
+            return TrainReport(message="scikit-learn not installed.")
+
+        n = len(y)
+        n_wins   = int(np.sum(np.asarray(y) == 1))
+        n_losses = n - n_wins
+
+        if n < min_samples:
+            return TrainReport(
+                n_samples=n, n_wins=n_wins, n_losses=n_losses,
+                message=f"Not enough trades to train ({n} < {min_samples}). "
+                        f"Keep trading to collect more data.",
+            )
+        if n_wins == 0 or n_losses == 0:
+            return TrainReport(
+                n_samples=n, n_wins=n_wins, n_losses=n_losses,
+                message="Need both winning and losing trades to learn.",
+            )
+
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.int64)
+
+        # Hold out a small test split when there is enough data.
+        if n >= 60:
+            X_tr, X_te, y_tr, y_te = train_test_split(
+                X, y, test_size=0.25, random_state=42, stratify=y,
+            )
+        else:
+            X_tr, X_te, y_tr, y_te = X, X, y, y
+
+        model = GradientBoostingClassifier(
+            n_estimators=200, max_depth=3, learning_rate=0.05, random_state=42,
+        )
+        model.fit(X_tr, y_tr)
+
+        proba = model.predict_proba(X_te)[:, 1]
+        preds = (proba >= 0.5).astype(int)
+        acc   = float(accuracy_score(y_te, preds))
+        try:
+            auc = float(roc_auc_score(y_te, proba))
+        except ValueError:
+            auc = 0.0
+
+        self._model = model
+        self._feature_names = list(feature_names)
+        self._save()
+
+        logger.info(
+            "WinClassifier trained — n=%d acc=%.3f auc=%.3f", n, acc, auc,
+        )
+        return TrainReport(
+            trained=True, n_samples=n, n_wins=n_wins, n_losses=n_losses,
+            accuracy=acc, auc=auc, feature_names=self._feature_names,
+            message="Model trained and saved.",
+        )
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+
+    def predict_win_proba(self, features: dict[str, float]) -> Optional[float]:
+        """Return P(win) for one trade's feature dict, or None if no model."""
+        if self._model is None and not self.load():
+            return None
+        x = np.array([[float(features.get(name, 0.0)) for name in self._feature_names]],
+                     dtype=np.float64)
+        try:
+            return float(self._model.predict_proba(x)[0, 1])
+        except Exception as exc:
+            logger.debug("WinClassifier predict failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def _save(self) -> None:
+        if not _SKLEARN_OK or self._model is None:
+            return
+        self.model_path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(
+            {"model": self._model, "feature_names": self._feature_names},
+            self.model_path,
+        )
+
+    def load(self) -> bool:
+        """Load a previously trained model. Returns True on success."""
+        if not _SKLEARN_OK or not self.model_path.exists():
+            return False
+        try:
+            blob = joblib.load(self.model_path)
+            self._model         = blob["model"]
+            self._feature_names = blob["feature_names"]
+            return True
+        except Exception as exc:
+            logger.warning("WinClassifier load failed: %s", exc)
+            return False

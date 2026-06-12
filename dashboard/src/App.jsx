@@ -4,6 +4,8 @@ import StrategyComparison from './components/StrategyComparison.jsx'
 import PositionsTable     from './components/PositionsTable.jsx'
 import RiskStatus         from './components/RiskStatus.jsx'
 import TradesFeed         from './components/TradesFeed.jsx'
+import TradingControls    from './components/TradingControls.jsx'
+import RetrainControls    from './components/RetrainControls.jsx'
 import useWebSocket       from './hooks/useWebSocket.js'
 
 // ---------------------------------------------------------------------------
@@ -29,6 +31,9 @@ export default function App() {
   const [risk,       setRisk]       = useState(null)        // latest risk snapshot
   const [trades,     setTrades]     = useState([])          // recent trades (newest first)
   const [alerts,     setAlerts]     = useState([])          // risk / emergency alerts
+  const [account,    setAccount]    = useState(null)        // real MT5 account { balance, equity, currency … }
+  const [running,    setRunning]    = useState(false)       // trading loop active
+  const [emergency,  setEmergency]  = useState(false)       // emergency stop engaged
 
   const { lastMessage, status } = useWebSocket(WS_URL)
 
@@ -69,6 +74,11 @@ export default function App() {
         if (payload.positions?.positions) setPositions(payload.positions.positions)
         else if (Array.isArray(payload.positions)) setPositions(payload.positions)
         if (payload.risk)          setRisk(payload.risk)
+        if (payload.account && Object.keys(payload.account).length) setAccount(payload.account)
+        if (payload.status) {
+          if (typeof payload.status.running === 'boolean') setRunning(payload.status.running)
+          if (typeof payload.status.emergency_active === 'boolean') setEmergency(payload.status.emergency_active)
+        }
         break
 
       case 'tick':
@@ -76,6 +86,7 @@ export default function App() {
         if (payload.portfolio)    setPortfolio(payload.portfolio)
         if (payload.risk)         setRisk(payload.risk)
         if (payload.trades)       mergeTrades(payload.trades)
+        if (payload.account && Object.keys(payload.account).length) setAccount(payload.account)
         break
 
       case 'positions':
@@ -108,8 +119,12 @@ export default function App() {
   }, [lastMessage, mergeEquity, mergeTrades])
 
   // ---- Derived values -------------------------------------------------
-  const equity_val  = portfolio?.equity        ?? 0
-  const balance     = portfolio?.balance       ?? 0
+  // Prefer the REAL MT5 account figures when connected; otherwise fall back
+  // to the internal monitor's portfolio tracking.
+  const ccy         = account?.currency ?? 'USD'
+  const equity_val  = account?.equity  ?? portfolio?.equity  ?? 0
+  const balance     = account?.balance ?? portfolio?.balance ?? 0
+  const free_margin = account?.free_margin ?? null
   const daily_pnl   = portfolio?.daily_pnl     ?? 0
   const daily_pct   = portfolio?.daily_pnl_pct ?? 0
   const drawdown    = portfolio?.drawdown_pct  ?? 0
@@ -126,8 +141,11 @@ export default function App() {
         </div>
 
         <div className="header-metrics">
-          <Metric label="EQUITY"   value={`$${fmt(equity_val)}`} />
-          <Metric label="BALANCE"  value={`$${fmt(balance)}`} />
+          <Metric label={`EQUITY (${ccy})`}  value={fmt(equity_val)} />
+          <Metric label={`BALANCE (${ccy})`} value={fmt(balance)} />
+          {free_margin != null && (
+            <Metric label={`FREE MARGIN (${ccy})`} value={fmt(free_margin)} />
+          )}
           <Metric
             label="DAY P&L"
             value={`${daily_pnl >= 0 ? '+' : ''}$${fmt(Math.abs(daily_pnl))}`}
@@ -147,6 +165,7 @@ export default function App() {
         </div>
 
         <div className="header-right">
+          <TradingControls running={running} emergency={emergency} />
           <WsStatusBadge status={status} />
           {alerts.length > 0 && (
             <button className="alert-badge" onClick={() => setAlerts([])}>
@@ -185,6 +204,7 @@ export default function App() {
         <section className="panel panel-strategy">
           <PanelHeader title="Strategy Performance" />
           <div className="panel-body">
+            <RetrainControls />
             <StrategyComparison strategies={strategies} />
           </div>
         </section>

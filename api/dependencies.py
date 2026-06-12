@@ -88,6 +88,7 @@ class AppState:
         self.backtest_engine  = None   # BacktestEngine
         self.feature_store    = None   # FeatureStore
         self.data_feed        = None   # DataFeed
+        self.retrain_service  = None   # RetrainService (learning models)
 
         # Strategy registry  { name: AlphaModel }
         self.strategies:      dict[str, Any] = {}

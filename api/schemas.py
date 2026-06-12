@@ -12,6 +12,8 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from config.settings import settings
+
 
 # ---------------------------------------------------------------------------
 # Shared envelope
@@ -36,11 +38,19 @@ def err(msg: str) -> dict:
 # ---------------------------------------------------------------------------
 
 class TradingStartRequest(BaseModel):
-    symbols:              list[str]   = Field(default=["EURUSD"])
-    timeframe:            str         = Field(default="H1")
-    cycle_interval_s:     int         = Field(default=3600, ge=60, le=86400)
-    initial_balance:      float       = Field(default=100_000.0, gt=0)
-    allocation_method:    str         = Field(default="RISK_PARITY")
+    # Defaults come from .env (config.settings.trading) so the pairs and
+    # parameters can be changed without touching code.
+    symbols:              list[str]   = Field(default_factory=lambda: list(settings.trading.symbols))
+    timeframe:            str         = Field(default_factory=lambda: settings.trading.timeframe)
+    cycle_interval_s:     int         = Field(default_factory=lambda: settings.trading.cycle_seconds, ge=60, le=86400)
+    warmup_bars:          int         = Field(default_factory=lambda: settings.trading.warmup_bars, ge=50, le=5000)
+    initial_balance:      float       = Field(default_factory=lambda: settings.trading.initial_balance, gt=0)
+    allocation_method:    str         = Field(default_factory=lambda: settings.trading.allocation_method)
+    htf_enabled:          bool        = Field(default_factory=lambda: settings.trading.htf_enabled)
+    htf_timeframe:        str         = Field(default_factory=lambda: settings.trading.htf_timeframe)
+    verbose_signals:      bool        = Field(default_factory=lambda: settings.trading.verbose_signals)
+    ml_filter_enabled:    bool        = Field(default_factory=lambda: settings.trading.ml_filter_enabled)
+    ml_min_win_proba:     float       = Field(default_factory=lambda: settings.trading.ml_min_win_proba, ge=0.0, le=1.0)
 
     class Config:
         json_schema_extra = {
@@ -58,6 +68,13 @@ class TradingStopRequest(BaseModel):
 
 class EmergencyStopRequest(BaseModel):
     reason: str = Field(default="manual", min_length=1, max_length=200)
+
+
+class RetrainRequest(BaseModel):
+    """Trigger a manual retraining of the learning models from results."""
+    train_ml:     bool = Field(default=True)
+    train_rl:     bool = Field(default=False)
+    rl_timesteps: int  = Field(default=50_000, ge=1_000, le=2_000_000)
 
 
 class TradingStatusResponse(BaseModel):

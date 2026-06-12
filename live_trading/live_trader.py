@@ -49,6 +49,7 @@ import pandas as pd
 from engines.execution_engine.execution_engine import (
     ExecutionConfig,
     ExecutionResult,
+    ExecutionStatus,
     MT5ExecutionEngine,
 )
 from engines.portfolio_engine.portfolio_engine import (
@@ -70,6 +71,8 @@ from engines.signal_engine.signal_aggregator import (
 )
 from research.alpha_models.base import AlphaModel, AlphaSignal, SignalType
 from research.feature_store.feature_engineer import FeatureConfig, FeatureEngineer
+from live_trading.experience_collector import ExperienceCollector, extract_observation
+from strategies.ml_agent.win_classifier import WinClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,35 @@ def _get_mt5_tf(timeframe: str) -> int:
     return _MT5_TF_MAP.get(timeframe.upper(), 16385)  # 16385 = H1 fallback
 
 
+# Ordered list of supported timeframes (shortest → longest).
+_TF_ORDER: list[str] = ["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"]
+
+
+def _derive_htf(timeframe: str, steps: int = 2) -> str:
+    """Pick a higher timeframe `steps` positions above the entry timeframe.
+
+    Example: H1 + 2 → D1, M15 + 2 → H1. Caps at the longest timeframe (W1).
+    """
+    tf = timeframe.upper()
+    if tf not in _TF_ORDER:
+        return "D1"
+    idx = min(_TF_ORDER.index(tf) + steps, len(_TF_ORDER) - 1)
+    return _TF_ORDER[idx]
+
+
+def _fmt_meta(meta: dict) -> str:
+    """Compact one-line render of a signal's diagnostic metadata."""
+    if not meta:
+        return ""
+    parts = []
+    for k, v in meta.items():
+        if isinstance(v, float):
+            parts.append(f"{k}={v:g}")
+        else:
+            parts.append(f"{k}={v}")
+    return "(" + ", ".join(parts) + ")"
+
+
 # ---------------------------------------------------------------------------
 # Cycle status
 # ---------------------------------------------------------------------------
@@ -107,6 +139,7 @@ def _get_mt5_tf(timeframe: str) -> int:
 class CycleStatus(Enum):
     OK            = auto()
     NO_SIGNAL     = auto()
+    ML_FILTERED   = auto()
     RISK_BLOCKED  = auto()
     EXECUTION_ERR = auto()
     DATA_ERROR    = auto()
@@ -170,6 +203,20 @@ class LiveTraderConfig:
     timeframe: str       = "H1"
     warmup_bars: int     = 200     # bars fetched for feature computation
 
+    # ---- Multi-timeframe trend filter -----------------------------------
+    # Confirms each entry signal against the trend of a higher timeframe
+    # (e.g. trade H1 signals only in the direction of the D1 trend).
+    htf_enabled:   bool = True
+    htf_timeframe: str  = ""    # "" → auto-derived from `timeframe` (+2 steps)
+    htf_bars:      int  = 200   # bars fetched on the higher timeframe
+    htf_fast_ema:  int  = 20    # fast EMA period for the HTF trend
+    htf_slow_ema:  int  = 50    # slow EMA period for the HTF trend
+
+    # ---- Diagnostics ----------------------------------------------------
+    # When True, each cycle logs WHY a signal is HOLD/actionable (indicator
+    # values: EMA gap, RSI, z-score, and the higher-timeframe trend).
+    verbose_signals: bool = True
+
     # ---- Scheduling ------------------------------------------------------
     cycle_interval_seconds: int = 3600    # 3600 = hourly for H1
     cycle_timeout_seconds:  int = 120     # max time per cycle before kill
@@ -205,6 +252,21 @@ class LiveTraderConfig:
 
     # ---- I/O -----------------------------------------------------------
     log_dir: str = "data/storage/logs/live"
+
+    # ---- Training-data collection --------------------------------------
+    # When True, every executed trade's entry observation + realized outcome
+    # is written to dataset_dir (one record per trade — no per-cycle bloat),
+    # for offline RL / ML retraining.
+    collect_experiences: bool = True
+    dataset_dir: str = "data/storage/datasets"
+
+    # ---- ML win/loss confidence filter ---------------------------------
+    # When enabled, the trained WinClassifier predicts P(win) from the entry
+    # observation; trades below ml_min_win_proba are skipped. If no model is
+    # trained yet (or sklearn missing), the filter passes everything through.
+    ml_filter_enabled: bool = True
+    ml_min_win_proba:  float = 0.50
+    ml_model_path:     str   = "data/storage/models/win_classifier.joblib"
 
 
 # ---------------------------------------------------------------------------
@@ -304,32 +366,40 @@ class LiveTrader:
     def __init__(self, config: LiveTraderConfig | None = None) -> None:
         self.cfg = config or LiveTraderConfig()
 
+        # Resolve the higher timeframe once (auto-derive if left blank).
+        if self.cfg.htf_enabled and not self.cfg.htf_timeframe:
+            self.cfg.htf_timeframe = _derive_htf(self.cfg.timeframe)
+
         # ---- Sub-engines ------------------------------------------------
         self._feature_eng  = FeatureEngineer(self.cfg.feature_config)
         self._aggregator   = SignalAggregator()
         self._risk_engine  = RiskEngine(self.cfg.risk_config)
         self._allocator    = PortfolioAllocator(
             total_capital   = self.cfg.initial_balance,
-            default_method  = self.cfg.allocation_method,
         )
         self._exec_engine  = MT5ExecutionEngine(
             ExecutionConfig(
                 login        = self.cfg.mt5_login,
                 password     = self.cfg.mt5_password,
                 server       = self.cfg.mt5_server,
-                path         = self.cfg.mt5_path,
+                mt5_path     = self.cfg.mt5_path,
                 magic_number = self.cfg.magic_number,
             )
         )
 
         # ---- State -------------------------------------------------------
         self._portfolio_state = PortfolioState(
-            equity        = self.cfg.initial_balance,
-            balance       = self.cfg.initial_balance,
-            open_positions= [],
-            daily_pnl     = 0.0,
-            daily_trades  = 0,
+            equity             = self.cfg.initial_balance,
+            balance            = self.cfg.initial_balance,
+            peak_equity        = self.cfg.initial_balance,
+            daily_start_equity = self.cfg.initial_balance,
+            open_positions     = [],
         )
+        # Daily-loss / drawdown references are re-anchored to the REAL account
+        # equity on the first live read (see _sync_account_state). Until then
+        # they use the configured initial_balance.
+        self._account_anchored = False
+        self._anchor_day: Optional[str] = None
         self._cycle_id         = 0
         self._consecutive_ok   = 0
         self._retry_count      = 0
@@ -347,6 +417,34 @@ class LiveTrader:
         self._hooks: list[MonitoringHook] = [
             JsonFileLogger(self.cfg.log_dir)
         ]
+        # Direct reference to a TradingMonitor (if registered) so closed
+        # trades can be recorded with their realized PnL. Detected in
+        # register_hook by the presence of a record_trade() method.
+        self._monitor = None
+
+        # Open trades pending PnL reconciliation: ticket → entry metadata.
+        # When a position disappears from MT5 (closed by SL/TP), its realized
+        # PnL is fetched and fed to the learning components.
+        self._open_trades: dict[int, dict] = {}
+
+        # Latest feature observation per symbol (captured each cycle in
+        # stage 2), used to label each placed order with its entry state.
+        self._feature_snapshot: dict[str, dict] = {}
+
+        # Training-data collector — one record per closed trade.
+        self._experience = (
+            ExperienceCollector(self.cfg.dataset_dir)
+            if self.cfg.collect_experiences else None
+        )
+
+        # ML win/loss confidence filter. Loads the latest trained model if it
+        # exists; reloaded automatically when the model file changes on disk
+        # (e.g. after a /rl/retrain run) so live trading uses fresh weights.
+        self._win_clf: Optional[WinClassifier] = None
+        self._win_clf_mtime: float = 0.0
+        if self.cfg.ml_filter_enabled:
+            self._win_clf = WinClassifier(self.cfg.ml_model_path)
+            self._maybe_reload_classifier()
 
         # ---- OHLCV cache (symbol → DataFrame) ---------------------------
         self._data_cache: dict[str, pd.DataFrame] = {}
@@ -369,10 +467,8 @@ class LiveTrader:
         self._strategies.append(model)
         self._aggregator.set_weight(model.name, weight)
         self._allocator.register(
-            strategy_name   = model.name,
-            initial_capital = initial_capital or (
-                self.cfg.initial_balance / max(len(self._strategies), 1)
-            ),
+            name           = model.name,
+            initial_weight = weight,
         )
         logger.info("Strategy registered: %s (weight=%.2f)", model.name, weight)
         return self
@@ -380,6 +476,10 @@ class LiveTrader:
     def register_hook(self, hook: MonitoringHook) -> "LiveTrader":
         """Register a monitoring callback. Called after every cycle."""
         self._hooks.append(hook)
+        # If the hook can record closed trades (TradingMonitor), keep a direct
+        # reference so realized PnL can be persisted on trade close.
+        if self._monitor is None and callable(getattr(hook, "record_trade", None)):
+            self._monitor = hook
         return self
 
     # ------------------------------------------------------------------
@@ -462,6 +562,9 @@ class LiveTrader:
                 if self._stop_event.is_set() or self._emergency.is_active:
                     break
                 self._run_with_recovery(symbol)
+
+            # ---- Record PnL of trades closed by SL/TP (learning loop) ---
+            self._reconcile_closed_trades()
 
             # ---- Rebalance allocations after all symbols ----------------
             self._rebalance_portfolio()
@@ -553,6 +656,13 @@ class LiveTrader:
         try:
             self._emergency.check_or_raise()
 
+            # Refresh equity/balance from the live account so EVERY cycle
+            # (including NO_SIGNAL / RISK_BLOCKED) reports the real portfolio
+            # state. Without this, early-return cycles leave portfolio_state
+            # = None → monitor sees equity 0 → false 100% drawdown alerts.
+            self._sync_account_state()
+            result.portfolio_state = self._portfolio_state
+
             # 1. Fetch data -----------------------------------------------
             data = self._fetch_data(symbol)
             if data is None or len(data) < self.cfg.warmup_bars // 2:
@@ -564,8 +674,15 @@ class LiveTrader:
             # 2. Compute features -----------------------------------------
             features = self._compute_features(data)
             result.n_features = features.shape[1]
+            # Snapshot the entry observation so any order placed this cycle
+            # can be labelled with the exact state that produced it.
+            if self._experience is not None:
+                self._feature_snapshot[symbol] = extract_observation(features)
 
             # 3. Run alpha models -----------------------------------------
+            if self.cfg.verbose_signals:
+                logger.info("[%s] analysing %d bars (%s)…",
+                            symbol, len(data), self.cfg.timeframe)
             signals = self._run_alpha_models(features)
             result.signals = signals
             if not signals:
@@ -575,12 +692,66 @@ class LiveTrader:
             # 4. Aggregate signals ----------------------------------------
             decision = self._aggregate_signals(signals)
             result.decision = decision
-            if (
-                decision.signal == SignalType.HOLD
-                or decision.confidence < self.cfg.min_confidence
-            ):
+            if self.cfg.verbose_signals:
+                logger.info(
+                    "    AGG → %-4s conf=%.3f (min=%.2f)",
+                    decision.signal.name, decision.confidence,
+                    self.cfg.min_confidence,
+                )
+            if decision.signal == SignalType.HOLD:
+                if self.cfg.verbose_signals:
+                    logger.info("    [%s] HOLD — strategies disagree / no setup", symbol)
                 result.status = CycleStatus.NO_SIGNAL
                 return result
+            if decision.confidence < self.cfg.min_confidence:
+                if self.cfg.verbose_signals:
+                    logger.info(
+                        "    [%s] %s skipped — confidence %.3f < min %.2f",
+                        symbol, decision.signal.name, decision.confidence,
+                        self.cfg.min_confidence,
+                    )
+                result.status = CycleStatus.NO_SIGNAL
+                return result
+
+            # 4b. Multi-timeframe trend filter ----------------------------
+            # Only trade in the direction of the higher-timeframe trend.
+            if self.cfg.htf_enabled:
+                htf_trend = self._htf_trend(symbol)
+                if self.cfg.verbose_signals:
+                    logger.info(
+                        "    HTF(%s) trend = %s",
+                        self.cfg.htf_timeframe, htf_trend.name,
+                    )
+                if htf_trend != SignalType.HOLD and decision.signal != htf_trend:
+                    logger.info(
+                        "    [%s] HTF filter: %s entry vs %s trend \u2192 skip",
+                        symbol, decision.signal.name, htf_trend.name,
+                    )
+                    result.status = CycleStatus.NO_SIGNAL
+                    return result
+
+            # 4c. ML win/loss confidence filter ---------------------------
+            # The classifier learns from the system's own closed-trade results
+            # and predicts P(win) for this entry. Skip trades it judges weak.
+            if self._win_clf is not None:
+                self._maybe_reload_classifier()
+                obs = self._feature_snapshot.get(symbol)
+                if obs is None:
+                    obs = extract_observation(features)
+                win_p = self._win_clf.predict_win_proba(obs)
+                if win_p is not None:
+                    if self.cfg.verbose_signals:
+                        logger.info(
+                            "    ML P(win) = %.3f (min=%.2f)",
+                            win_p, self.cfg.ml_min_win_proba,
+                        )
+                    if win_p < self.cfg.ml_min_win_proba:
+                        logger.info(
+                            "    [%s] ML filter: P(win) %.3f < min %.2f \u2192 skip",
+                            symbol, win_p, self.cfg.ml_min_win_proba,
+                        )
+                        result.status = CycleStatus.ML_FILTERED
+                        return result
 
             # 5. Apply risk engine ----------------------------------------
             trade_order  = self._build_trade_order(symbol, decision)
@@ -588,7 +759,7 @@ class LiveTrader:
             result.risk_decision = risk_decision
             if risk_decision.verdict.name in ("BLOCK",):
                 result.status = CycleStatus.RISK_BLOCKED
-                logger.info("[%s] Risk BLOCK — %s", symbol, risk_decision.reason)
+                logger.info("[%s] Risk BLOCK — %s", symbol, risk_decision.blocking_reasons)
                 return result
 
             # 6. Allocate capital -----------------------------------------
@@ -659,6 +830,67 @@ class LiveTrader:
             return None
 
     # ------------------------------------------------------------------
+    # Stage 1b — Higher-timeframe trend
+    # ------------------------------------------------------------------
+
+    def _htf_trend(self, symbol: str) -> SignalType:
+        """
+        Determine the higher-timeframe trend via EMA crossover.
+
+        Returns BUY (uptrend), SELL (downtrend), or HOLD when the trend is
+        neutral / undetermined (which lets the entry signal pass through).
+        """
+        try:
+            import MetaTrader5 as mt5
+
+            rates = mt5.copy_rates_from_pos(
+                symbol,
+                _get_mt5_tf(self.cfg.htf_timeframe),
+                0,
+                self.cfg.htf_bars,
+            )
+            if rates is None or len(rates) < self.cfg.htf_slow_ema + 2:
+                return SignalType.HOLD
+
+            close = pd.Series(rates["close"], dtype=float)
+            fast = close.ewm(span=self.cfg.htf_fast_ema, adjust=False).mean().iloc[-1]
+            slow = close.ewm(span=self.cfg.htf_slow_ema, adjust=False).mean().iloc[-1]
+
+            if fast > slow:
+                return SignalType.BUY
+            if fast < slow:
+                return SignalType.SELL
+            return SignalType.HOLD
+
+        except ImportError:
+            return SignalType.HOLD
+        except Exception as exc:
+            logger.warning("[%s] HTF trend computation failed: %s", symbol, exc)
+            return SignalType.HOLD
+
+    # ------------------------------------------------------------------
+    # ML confidence filter — hot-reload of the trained model
+    # ------------------------------------------------------------------
+
+    def _maybe_reload_classifier(self) -> None:
+        """(Re)load the win/loss model when its file appears or changes.
+
+        Lets the live trader pick up a freshly retrained model (after a
+        /rl/retrain run) without a restart. Cheap stat() check per cycle.
+        """
+        if self._win_clf is None:
+            return
+        try:
+            mtime = self._win_clf.model_path.stat().st_mtime
+        except OSError:
+            return  # no model file yet — filter passes everything through
+        if mtime <= self._win_clf_mtime:
+            return
+        if self._win_clf.load():
+            self._win_clf_mtime = mtime
+            logger.info("WinClassifier model loaded (mtime=%.0f).", mtime)
+
+    # ------------------------------------------------------------------
     # Stage 2 — Compute features
     # ------------------------------------------------------------------
 
@@ -681,10 +913,17 @@ class LiveTrader:
             try:
                 sig = model.compute(features)
                 signals.append(sig)
-                logger.debug(
-                    "  [%s] → %s (conf=%.3f)",
-                    model.name, sig.signal.name, sig.confidence,
-                )
+                if self.cfg.verbose_signals:
+                    logger.info(
+                        "    %-14s → %-4s conf=%.3f %s",
+                        model.name, sig.signal.name, sig.confidence,
+                        _fmt_meta(sig.metadata),
+                    )
+                else:
+                    logger.debug(
+                        "  [%s] → %s (conf=%.3f)",
+                        model.name, sig.signal.name, sig.confidence,
+                    )
             except Exception as exc:
                 logger.warning("Strategy %s raised: %s", model.name, exc)
         return signals
@@ -705,23 +944,39 @@ class LiveTrader:
         symbol: str,
         decision: AggregatedDecision,
     ) -> TradeOrder:
-        equity     = self._portfolio_state.equity
-        atr_proxy  = self._get_atr_proxy(symbol)
-        size       = self._risk_engine.compute_atr_size(equity, atr_proxy)
+        equity      = self._portfolio_state.equity
+        atr_proxy   = self._get_atr_proxy(symbol)
+        entry_price = self._get_last_price(symbol)
+        direction   = 1 if decision.signal == SignalType.BUY else -1
+
+        # Initial volatility-based size: risk a fixed fraction of equity per
+        # ATR-based stop distance. The RiskEngine re-caps this in Layer 4.
+        risk_cfg    = self._risk_engine.config
+        risk_amount = equity * risk_cfg.risk_per_trade_pct
+        sl_distance = max(atr_proxy * risk_cfg.atr_multiplier, 1e-9)
+        size        = round(risk_amount / sl_distance, 2)
 
         return TradeOrder(
-            symbol    = symbol,
-            direction = decision.signal.name,
-            size      = size,
-            strategy  = "aggregated",
-            confidence= decision.confidence,
+            symbol      = symbol,
+            strategy    = "aggregated",
+            direction   = direction,
+            size        = size,
+            entry_price = entry_price,
+            atr         = atr_proxy,
         )
 
     def _apply_risk(self, order: TradeOrder) -> RiskDecision:
         return self._risk_engine.evaluate_portfolio_risk(
-            proposed_trades  = [order],
-            portfolio_state  = self._portfolio_state,
+            trades          = [order],
+            portfolio_state = self._portfolio_state,
         )
+
+    def _get_last_price(self, symbol: str) -> float:
+        """Latest close price from cached OHLCV data (fallback 0.0)."""
+        data = self._data_cache.get(symbol)
+        if data is None or len(data) == 0:
+            return 0.0
+        return float(data["close"].values[-1])
 
     def _get_atr_proxy(self, symbol: str) -> float:
         """Estimate ATR from cached data (last 14 bars)."""
@@ -757,32 +1012,49 @@ class LiveTrader:
     ) -> list[ExecutionResult]:
         results = []
         try:
-            # Apply size reduction from risk engine (REDUCE verdict)
-            if risk_decision.verdict.name == "REDUCE":
-                order.size *= risk_decision.size_multiplier
+            # The RiskEngine already applied any size reduction (REDUCE verdict)
+            # to the orders in approved_trades. Execute those directly.
+            approved = risk_decision.approved_trades or [order]
 
-            result = self._exec_engine.execute(decision, order)
-            results.append(result)
+            for approved_order in approved:
+                result = self._exec_engine.execute(decision, approved_order)
+                results.append(result)
 
-            if result.status == "FILLED":
-                logger.info(
-                    "✓ FILLED %s | ticket=%s | price=%.5f | size=%.2f",
-                    order.symbol,
-                    result.ticket,
-                    result.fill_price,
-                    order.size,
-                )
-                # Record trade outcome for performance weighting
-                for model in self._strategies:
-                    self._aggregator.record_trade(
-                        strategy_name = model.name,
-                        pnl           = 0.0,    # filled at entry — PnL unknown yet
+                if result.status == ExecutionStatus.FILLED:
+                    logger.info(
+                        "\u2713 FILLED %s | ticket=%s | price=%.5f | size=%.2f",
+                        approved_order.symbol,
+                        result.ticket,
+                        result.fill_price,
+                        approved_order.size,
                     )
-            else:
-                logger.warning(
-                    "✗ REJECTED %s | status=%s | retries=%d",
-                    order.symbol, result.status, result.retries,
-                )
+                    # Track this trade so its realized PnL can be recorded
+                    # when the position closes (SL/TP). Attribute it to the
+                    # strategies that voted in the trade's direction.
+                    contributors = [
+                        v["strategy"] for v in (decision.votes or [])
+                        if v.get("counted") and v.get("signal") == decision.signal.value
+                    ] or [m.name for m in self._strategies]
+                    self._open_trades[result.ticket] = {
+                        "symbol":      approved_order.symbol,
+                        "strategies":  contributors,
+                        "direction":   "BUY" if approved_order.direction == +1 else "SELL",
+                        "size":        approved_order.size,
+                        "entry_price": result.fill_price,
+                        "entry_ts":    datetime.now(timezone.utc),
+                        "entry_cycle": self._cycle_id,
+                        "confidence":  decision.confidence,
+                        # Entry observation for training (only kept if the
+                        # experience collector is enabled).
+                        "features":    self._feature_snapshot.get(approved_order.symbol)
+                                       if self._experience is not None else None,
+                    }
+                else:
+                    logger.warning(
+                        "\u2717 REJECTED %s | status=%s | retries=%d | reason: %s",
+                        approved_order.symbol, result.status, result.retries,
+                        result.message or "(no detail)",
+                    )
         except Exception as exc:
             logger.error("Execution error for %s: %s", order.symbol, exc)
 
@@ -791,6 +1063,49 @@ class LiveTrader:
     # ------------------------------------------------------------------
     # Post-cycle updates
     # ------------------------------------------------------------------
+
+    def _sync_account_state(self) -> None:
+        """Refresh equity/balance from the live MT5 account (best-effort).
+
+        Called at the start of every cycle so portfolio_state always carries
+        a real, non-zero equity even on cycles that take no trade.
+
+        On the first real read (and at each new day) the daily-loss and
+        drawdown reference points are re-anchored to the *actual* account
+        equity. Without this, daily_start_equity stays at the configured
+        initial_balance (e.g. 100k) while real equity is ~10k → the risk
+        engine sees a fake 90% daily loss and trips the kill switch.
+        """
+        try:
+            account = self._exec_engine.get_account_info()
+            if not account:
+                return
+            eq  = account.get("equity")
+            bal = account.get("balance")
+            if eq is not None and eq > 0:
+                self._portfolio_state.equity = eq
+            if bal is not None and bal > 0:
+                self._portfolio_state.balance = bal
+
+            # Track the running high-water mark for drawdown calculations.
+            if eq is not None and eq > self._portfolio_state.peak_equity:
+                self._portfolio_state.peak_equity = eq
+
+            # Re-anchor references to the real equity on first read / new day.
+            today = datetime.now(timezone.utc).strftime("%Y%m%d")
+            if eq is not None and eq > 0 and (
+                not self._account_anchored or self._anchor_day != today
+            ):
+                self._portfolio_state.daily_start_equity = eq
+                if not self._account_anchored:
+                    self._portfolio_state.peak_equity = eq
+                self._account_anchored = True
+                self._anchor_day = today
+                logger.info(
+                    "Risk references anchored to live equity: %.2f", eq
+                )
+        except Exception as exc:
+            logger.debug("Account equity sync failed: %s", exc)
 
     def _post_cycle_update(
         self,
@@ -809,12 +1124,12 @@ class LiveTrader:
             if positions is not None:
                 self._portfolio_state.open_positions = [
                     OpenPosition(
-                        symbol    = p.symbol,
-                        direction = p.direction,
-                        size      = p.volume,
-                        entry_price = p.price_open,
-                        strategy  = "live",
-                        unrealized_pnl = p.profit,
+                        symbol        = p.symbol,
+                        strategy      = "live",
+                        direction     = p.direction,
+                        size          = p.volume,
+                        entry_price   = p.open_price,
+                        current_price = p.current_price,
                     )
                     for p in positions
                 ]
@@ -830,6 +1145,111 @@ class LiveTrader:
                             {k: round(v, 0) for k, v in result.allocations.items()})
         except Exception as exc:
             logger.warning("Rebalance failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Closed-trade reconciliation — the learning feedback loop
+    # ------------------------------------------------------------------
+
+    def _reconcile_closed_trades(self) -> None:
+        """Detect positions closed by MT5 (SL/TP), record their realized PnL,
+        and feed it to the learning components so the system improves:
+
+          * SignalAggregator.record_trade  -> reweights strategies by win-rate
+          * PortfolioAllocator.record_pnl  -> reallocates capital by Sharpe
+          * TradingMonitor.record_trade    -> persists the closed trade
+
+        Runs once per cycle sweep. Compares tracked entry tickets against the
+        positions still open in MT5; any missing ticket has been closed.
+        """
+        if not self._open_trades:
+            return
+
+        try:
+            open_now = {p.ticket for p in self._exec_engine.get_open_positions()}
+        except Exception as exc:
+            logger.debug("Reconciliation skipped — cannot list positions: %s", exc)
+            return
+
+        closed_tickets = [t for t in list(self._open_trades) if t not in open_now]
+        for ticket in closed_tickets:
+            info = self._open_trades.pop(ticket)
+
+            res = None
+            try:
+                res = self._exec_engine.get_closed_pnl(ticket)
+            except Exception as exc:
+                logger.debug("get_closed_pnl(%s) failed: %s", ticket, exc)
+            if not res:
+                # PnL not resolvable yet — re-track so we retry next sweep.
+                self._open_trades[ticket] = info
+                continue
+
+            pnl        = float(res.get("pnl", 0.0))
+            exit_price = float(res.get("exit_price", 0.0))
+            ts         = datetime.now(timezone.utc)
+            duration_s = int((ts - info["entry_ts"]).total_seconds())
+
+            # 1) Feed the learning components, per contributing strategy.
+            for strat in info["strategies"]:
+                try:
+                    self._aggregator.record_trade(strategy=strat, pnl=pnl)
+                except Exception as exc:
+                    logger.debug("aggregator.record_trade(%s) failed: %s", strat, exc)
+                try:
+                    self._allocator.record_pnl(strategy=strat, pnl=pnl)
+                except KeyError:
+                    pass  # strategy not registered in the allocator
+                except Exception as exc:
+                    logger.debug("allocator.record_pnl(%s) failed: %s", strat, exc)
+
+            # 2) Persist the closed trade (JSON/MySQL + WebSocket push).
+            primary = info["strategies"][0] if info["strategies"] else "live"
+            if self._monitor is not None:
+                try:
+                    self._monitor.record_trade(
+                        ts          = ts,
+                        symbol      = info["symbol"],
+                        strategy    = primary,
+                        direction   = info["direction"],
+                        size        = info["size"],
+                        entry_price = info["entry_price"],
+                        exit_price  = exit_price,
+                        pnl         = pnl,
+                        duration_s  = duration_s,
+                        exit_reason = "closed",
+                        ticket      = str(ticket),
+                    )
+                except Exception as exc:
+                    logger.warning("monitor.record_trade failed: %s", exc)
+
+            outcome = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
+            logger.info(
+                "Trade closed [%s] ticket=%s pnl=%.2f %s (%s) -> learning updated",
+                info["symbol"], ticket, pnl, outcome,
+                ", ".join(info["strategies"]),
+            )
+
+            # 3) Persist a compact training experience (one record per trade:
+            #    entry observation + action + realized outcome — no bloat).
+            if self._experience is not None:
+                self._experience.record({
+                    "ticket":      str(ticket),
+                    "symbol":      info["symbol"],
+                    "timeframe":   self.cfg.timeframe,
+                    "direction":   info["direction"],
+                    "size":        info["size"],
+                    "entry_ts":    info["entry_ts"],
+                    "entry_price": info["entry_price"],
+                    "exit_ts":     ts,
+                    "exit_price":  exit_price,
+                    "pnl":         pnl,
+                    "duration_s":  duration_s,
+                    "outcome":     outcome,
+                    "confidence":  info.get("confidence"),
+                    "strategies":  info["strategies"],
+                    "exit_reason": "closed",
+                    "features":    info.get("features") or {},
+                })
 
     def _update_trailing_stops(self) -> None:
         """Push trailing stop modifications to MT5."""

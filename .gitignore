@@ -21,7 +21,6 @@ env/
 # ── Environment / Secrets ─────────────────────────────────────────────────────
 .env
 .env.*
-!.env.example
 *.key
 secrets/
 

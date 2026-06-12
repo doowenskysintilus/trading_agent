@@ -26,6 +26,7 @@ Run
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -58,6 +59,7 @@ from api.schemas      import (
     BacktestStrategyMetrics, BacktestJobStatus,
     ManualTradeRequest, ClosePositionRequest, TradeExecutionResponse,
     RiskStatusResponse, RiskConfigUpdate, DrawdownPeriod,
+    RetrainRequest,
 )
 from api.dependencies import (
     AppState, BacktestJob,
@@ -164,14 +166,38 @@ def create_app(
             return ok({"message": "Trader is already running."})
 
         try:
+            import os
             from live_trading.live_trader import LiveTrader, LiveTraderConfig
             from engines.execution_engine.execution_engine import ExecutionConfig
+            from engines.portfolio_engine.portfolio_engine import AllocationMethod
+            from config.settings import settings
+
+            # Resolve allocation method from its enum NAME (e.g. "RISK_PARITY"),
+            # falling back to RISK_PARITY if an unknown value is supplied.
+            try:
+                alloc_method = AllocationMethod[body.allocation_method]
+            except KeyError:
+                alloc_method = AllocationMethod.RISK_PARITY
 
             cfg = LiveTraderConfig(
-                symbols            = body.symbols,
-                timeframe          = body.timeframe,
+                symbols                = body.symbols,
+                timeframe              = body.timeframe,
+                warmup_bars            = body.warmup_bars,
                 cycle_interval_seconds = body.cycle_interval_s,
-                allocation_method  = body.allocation_method,
+                allocation_method      = alloc_method,
+                initial_balance        = body.initial_balance,
+                htf_enabled            = body.htf_enabled,
+                htf_timeframe          = body.htf_timeframe,
+                verbose_signals        = body.verbose_signals,
+                ml_filter_enabled      = body.ml_filter_enabled,
+                ml_min_win_proba       = body.ml_min_win_proba,
+                # MT5 credentials sourced from .env (optional — an
+                # already-logged-in terminal works without them).
+                mt5_login    = settings.mt5.login,
+                mt5_password = settings.mt5.password,
+                mt5_server   = settings.mt5.server,
+                mt5_path     = settings.mt5.path,
+                magic_number = settings.mt5.magic_number,
             )
             trader = LiveTrader(config=cfg)
 
@@ -184,6 +210,12 @@ def create_app(
                 trader.register_hook(_state.monitor)
 
             _state.attach_trader(trader)
+            # Expose the trader's execution engine so /trades/* endpoints work.
+            _state.attach_engines(
+                execution = trader._exec_engine,
+                risk      = trader._risk_engine,
+                portfolio = trader._allocator,
+            )
             trader.start_background()
 
             return ok({
@@ -236,9 +268,109 @@ def create_app(
             pass
         return ok({**s, "allocations": allocs})
 
+    @app.get("/trading/config", tags=["trading"], dependencies=[Auth])
+    def trading_config():
+        """Default trading parameters from .env (pairs, timeframe, sizing).
+
+        Used by the dashboard to pre-fill the "Start Trading" panel.
+        """
+        from config.settings import settings as _cfg
+        return ok({
+            "symbols":           list(_cfg.trading.symbols),
+            "timeframe":         _cfg.trading.timeframe,
+            "cycle_interval_s":  _cfg.trading.cycle_seconds,
+            "warmup_bars":       _cfg.trading.warmup_bars,
+            "initial_balance":   _cfg.trading.initial_balance,
+            "allocation_method": _cfg.trading.allocation_method,
+            "htf_enabled":       _cfg.trading.htf_enabled,
+            "htf_timeframe":     _cfg.trading.htf_timeframe,
+            "ml_filter_enabled": _cfg.trading.ml_filter_enabled,
+            "ml_min_win_proba":  _cfg.trading.ml_min_win_proba,
+        })
+
     # ====================================================================
-    # /portfolio
+    # /rl  — learning models (manual retraining from collected results)
     # ====================================================================
+
+    @app.post("/rl/retrain", tags=["learning"], dependencies=[Auth])
+    def rl_retrain(body: RetrainRequest):
+        """Retrain the learning models from the system's own trade results.
+
+        * ML win/loss classifier — trained on collected trade experiences.
+        * RL agent (RecurrentPPO) — optional, retrained on market history.
+
+        Runs in the background; poll GET /rl/status for progress/results.
+        """
+        from research.training.retrain_service import RetrainService
+
+        svc = getattr(_state, "retrain_service", None)
+        if svc is None:
+            svc = RetrainService()
+            _state.retrain_service = svc
+
+        # When the trader is running, retrain RL on its configured symbol/TF.
+        rl_symbol = rl_tf = None
+        if _state.trader is not None:
+            cfg = getattr(_state.trader, "cfg", None)
+            if cfg is not None:
+                syms = getattr(cfg, "symbols", None)
+                rl_symbol = syms[0] if syms else None
+                rl_tf     = getattr(cfg, "timeframe", None)
+
+        try:
+            status_obj = svc.start(
+                train_ml     = body.train_ml,
+                train_rl     = body.train_rl,
+                rl_timesteps = body.rl_timesteps,
+                rl_symbol    = rl_symbol,
+                rl_timeframe = rl_tf,
+            )
+            return ok(status_obj)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+    @app.get("/rl/status", tags=["learning"], dependencies=[Auth])
+    def rl_status():
+        """Current state and last results of the retraining service."""
+        svc = getattr(_state, "retrain_service", None)
+        if svc is None:
+            return ok({"state": "idle", "message": "No retraining run yet."})
+        return ok(svc.status())
+
+    @app.get("/rl/progress", tags=["learning"], dependencies=[Auth])
+    def rl_progress(limit: int = 500):
+        """Reward-vs-time history of the RL agent for the live dashboard chart.
+
+        Reads the append-only progress log written during training (one point
+        per episode). Returns the most recent ``limit`` points so the curve can
+        confirm the reward trends upward over time.
+        """
+        from pathlib import Path as _Path
+        from strategies.rl_agent.rl_trainer import RLTrainerConfig
+
+        limit = max(1, min(int(limit), 5000))
+        progress_file = _Path(RLTrainerConfig().progress_path)
+        if not progress_file.exists():
+            return ok({"points": [], "message": "No RL training history yet."})
+
+        points: list[dict] = []
+        try:
+            with progress_file.open("r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for line in lines[-limit:]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    points.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except OSError as exc:
+            raise HTTPException(500, f"Could not read RL progress: {exc}") from exc
+
+        return ok({"points": points, "n": len(points)})
+
+
 
     @app.get("/portfolio/status", tags=["portfolio"], dependencies=[Auth])
     def portfolio_status():
@@ -276,6 +408,20 @@ def create_app(
         else:
             data = _state.monitor.get_equity_curve(limit=limit)
         return ok(data)
+
+    @app.get("/portfolio/account", tags=["portfolio"], dependencies=[Auth])
+    def portfolio_account():
+        """Real MT5 account info: balance, equity, margin, currency, leverage.
+
+        Returns 503 when no execution engine is attached yet (trading not
+        started) or when MT5 is not connected.
+        """
+        if _state.execution_engine is None:
+            raise HTTPException(503, "Execution engine not initialised (start trading first).")
+        info = _state.execution_engine.get_account_info()
+        if not info:
+            raise HTTPException(503, "MT5 not connected — no account info available.")
+        return ok(info)
 
     @app.get("/portfolio/allocations", tags=["portfolio"], dependencies=[Auth])
     def portfolio_allocations():
@@ -473,22 +619,39 @@ def create_app(
             raise HTTPException(503, "ExecutionEngine not initialised.")
 
         try:
-            from engines.signal_engine.signal_engine import Signal
+            from engines.signal_engine.signal_aggregator import AggregatedDecision
+            from engines.risk_engine.risk_engine import TradeOrder
+            from research.alpha_models.base import SignalType
 
-            # Map to internal Signal for ExecutionEngine
-            signal = {
-                "symbol":    body.symbol,
-                "direction": body.direction.value,
-                "size":      body.size,
-                "sl_price":  body.sl_price,
-                "tp_price":  body.tp_price,
-                "comment":   body.comment,
-            }
+            is_buy    = body.direction == TradeDirection.BUY
+            signal    = SignalType.BUY if is_buy else SignalType.SELL
+            direction = 1 if is_buy else -1
 
-            result = _state.execution_engine.execute(signal)
+            # Build a synthetic high-confidence decision for the manual order.
+            decision = AggregatedDecision(
+                signal     = signal,
+                confidence = 1.0,
+                buy_score  = 1.0 if is_buy else 0.0,
+                sell_score = 0.0 if is_buy else 1.0,
+                net_score  = 1.0 if is_buy else -1.0,
+                metadata   = {"source": "manual_override", "comment": body.comment},
+            )
+
+            trade = TradeOrder(
+                symbol      = body.symbol,
+                strategy    = "manual",
+                direction   = direction,
+                size        = body.size,
+                entry_price = body.sl_price or 0.0,
+                atr         = 0.0,
+                stop_loss   = body.sl_price,
+                take_profit = body.tp_price,
+            )
+
+            result = _state.execution_engine.execute(decision, trade)
 
             return ok({
-                "status":          result.status if hasattr(result, "status") else str(result),
+                "status":          result.status.value if hasattr(result.status, "value") else str(result.status),
                 "ticket":          getattr(result, "ticket",         None),
                 "fill_price":      getattr(result, "fill_price",     None),
                 "slippage_points": getattr(result, "slippage_points", None),
@@ -509,17 +672,16 @@ def create_app(
         if _state.execution_engine is None:
             raise HTTPException(503, "ExecutionEngine not initialised.")
         try:
-            if body.ticket:
-                result = _state.execution_engine.close_position(
-                    ticket  = body.ticket,
-                    comment = body.comment,
-                )
-            else:
-                result = _state.execution_engine.close_all(
-                    symbol  = body.symbol,
-                    comment = body.comment,
-                )
-            return ok(result if isinstance(result, dict) else {"status": str(result)})
+            result = _state.execution_engine.close_position(
+                symbol = body.symbol,
+                ticket = body.ticket,
+            )
+            return ok({
+                "status":     result.status.value if hasattr(result.status, "value") else str(result.status),
+                "ticket":     getattr(result, "ticket",     None),
+                "fill_price": getattr(result, "fill_price", None),
+                "message":    getattr(result, "message",    ""),
+            })
         except Exception as exc:
             logger.exception("Close position failed")
             raise HTTPException(500, f"Close failed: {exc}") from exc
@@ -684,6 +846,109 @@ def create_app(
         finally:
             await _ws_manager.disconnect(websocket)
 
+    # ====================================================================
+    # Startup — open a read-only MT5 connection so the dashboard can show
+    # the real account balance even before live trading is started, register
+    # the default alpha strategies, and attach a monitor for the dashboard.
+    # Best-effort: each step is skipped silently on failure.
+    # ====================================================================
+    @app.on_event("startup")
+    def _connect_mt5_account():
+        if _state.execution_engine is not None:
+            return  # a trader already attached its engine
+        try:
+            from engines.execution_engine.execution_engine import (
+                ExecutionConfig, MT5ExecutionEngine,
+            )
+            from config.settings import settings
+
+            exec_cfg = ExecutionConfig(
+                mt5_path     = settings.mt5.path or None,
+                login        = settings.mt5.login or None,
+                password     = settings.mt5.password or None,
+                server       = settings.mt5.server or None,
+                magic_number = settings.mt5.magic_number,
+            )
+            engine = MT5ExecutionEngine(config=exec_cfg)
+            if engine.connect():
+                _state.attach_engines(execution=engine)
+                logger.info("Read-only MT5 connection established for account info.")
+            else:
+                logger.info("MT5 account connection skipped (not logged in / unavailable).")
+        except Exception as exc:
+            logger.info("MT5 account connection skipped: %s", exc)
+
+    @app.on_event("startup")
+    def _register_default_strategies():
+        """Register the built-in alpha strategies so /trading/start works
+        out of the box (the dashboard START button needs at least one)."""
+        if _state.strategies:
+            return  # already populated
+        try:
+            from strategies.momentum.momentum_alpha import MomentumAlpha
+            from strategies.mean_reversion.mean_reversion_alpha import MeanReversionAlpha
+
+            for model in (MomentumAlpha(), MeanReversionAlpha()):
+                _state.register_strategy(model.name, model)
+            logger.info(
+                "Default strategies registered: %s",
+                list(_state.strategies.keys()),
+            )
+        except Exception as exc:
+            logger.warning("Could not register default strategies: %s", exc)
+
+        # Register the trained RL agent as an additional strategy, but only if
+        # a saved model exists (it is produced by /rl/retrain). Skipped
+        # silently otherwise so the system still runs on the rule-based
+        # strategies until the RL agent has been trained at least once.
+        try:
+            from pathlib import Path as _Path
+            from strategies.rl_agent.rl_trainer import RLTrainerConfig
+
+            _rl_cfg   = RLTrainerConfig()
+            _rl_model = _Path(_rl_cfg.model_dir) / f"{_rl_cfg.model_name}.zip"
+            if _rl_model.exists() and "rl_agent" not in _state.strategies:
+                from strategies.rl_agent.rl_alpha import RLAlpha
+
+                _algo = "RecurrentPPO" if _rl_cfg.use_recurrent_ppo else "PPO"
+                rl_alpha = RLAlpha(
+                    model_path  = str(_rl_model),
+                    algo        = _algo,
+                    window_size = _rl_cfg.window_size,
+                )
+                _state.register_strategy(rl_alpha.name, rl_alpha)
+                logger.info("RL agent registered from %s (%s).", _rl_model, _algo)
+            elif not _rl_model.exists():
+                logger.info(
+                    "No trained RL model yet (%s) — RL agent not registered. "
+                    "Train it via /rl/retrain.", _rl_model,
+                )
+        except Exception as exc:
+            logger.warning("Could not register RL agent: %s", exc)
+
+    @app.on_event("startup")
+    def _attach_default_monitor():
+        """Attach a TradingMonitor so the dashboard receives portfolio,
+        equity-curve and trade data."""
+        if _state.monitor is not None:
+            return
+        try:
+            from monitoring.monitor import TradingMonitor, MonitorConfig
+            from monitoring.metrics_store import MySQLConfig
+            from config.settings import settings
+
+            mon_cfg = MonitorConfig()
+            try:
+                if settings.mysql.enabled:
+                    mon_cfg.mysql_config = MySQLConfig.from_env()
+            except Exception:
+                pass
+
+            _state.attach_monitor(TradingMonitor(config=mon_cfg))
+            logger.info("TradingMonitor attached.")
+        except Exception as exc:
+            logger.warning("Could not attach monitor: %s", exc)
+
     return app
 
 
@@ -702,6 +967,8 @@ def _ws_build_snapshot(state: "AppState") -> dict:
             pass
     snap["positions"]  = _ws_get_positions(state)
     snap["strategies"] = _ws_get_strategies(state)
+    snap["account"]    = _ws_get_account(state)
+    snap["status"]     = _ws_get_status(state)
     return snap
 
 
@@ -716,6 +983,8 @@ def _ws_build_tick(state: "AppState") -> dict:
             payload["trades"]      = state.monitor.get_recent_trades(limit=5)
         except Exception:
             pass
+    payload["account"] = _ws_get_account(state)
+    payload["status"]  = _ws_get_status(state)
     return payload
 
 
@@ -735,6 +1004,33 @@ def _ws_get_strategies(state: "AppState") -> list:
         except Exception:
             pass
     return []
+
+
+def _ws_get_account(state: "AppState") -> dict:
+    """Real MT5 account snapshot (balance, equity, margin, currency).
+
+    Returns an empty dict when MT5 is not connected (e.g. no live trader
+    running yet), so the dashboard simply falls back to internal figures.
+    """
+    if state.execution_engine:
+        try:
+            info = state.execution_engine.get_account_info()
+            if info:
+                return info
+        except Exception:
+            pass
+    return {}
+
+
+def _ws_get_status(state: "AppState") -> dict:
+    """Lightweight trading-loop status for the dashboard controls."""
+    try:
+        return {
+            "running":          state.is_trader_running(),
+            "emergency_active": state.is_emergency_active(),
+        }
+    except Exception:
+        return {"running": False, "emergency_active": False}
 
 
 # Re-remove the old `return app` that was above — it's now in the WS block above.
@@ -903,11 +1199,16 @@ app = None  # populated by calling create_app() in your entry point
 def _build_default_app() -> "FastAPI":
     """
     Called when the module is loaded by uvicorn directly.
-    Override by setting environment variables or calling create_app() manually.
+    Reads configuration from `.env` (see config.settings). Override by
+    calling create_app() manually with explicit arguments.
     """
-    import os
-    key = os.environ.get("QUANT_API_KEY", "")
-    return create_app(api_key=key)
+    from config.settings import settings
+    return create_app(
+        api_key      = settings.api.api_key,
+        cors_origins = settings.cors.origins,
+        title        = settings.api.title,
+        version      = settings.api.version,
+    )
 
 
 if _FASTAPI_OK:
@@ -920,21 +1221,27 @@ if _FASTAPI_OK:
 
 if __name__ == "__main__":
     import argparse
-    import os
+    from config.settings import settings
 
     parser = argparse.ArgumentParser(description="Quant Fund Trading API")
-    parser.add_argument("--host",    default="0.0.0.0",    help="Bind host")
-    parser.add_argument("--port",    default=8000, type=int, help="Bind port")
-    parser.add_argument("--api-key", default=os.environ.get("QUANT_API_KEY", ""),
-                        help="API key (or set QUANT_API_KEY env var)")
-    parser.add_argument("--reload",  action="store_true",  help="Auto-reload on change")
+    parser.add_argument("--host",    default=settings.api.host,    help="Bind host")
+    parser.add_argument("--port",    default=settings.api.port, type=int, help="Bind port")
+    parser.add_argument("--api-key", default=settings.api.api_key,
+                        help="API key (or set QUANT_API_KEY in .env)")
+    parser.add_argument("--reload",  action="store_true", default=settings.api.reload,
+                        help="Auto-reload on change")
     args = parser.parse_args()
 
     if not _FASTAPI_OK:
         print("ERROR: FastAPI not installed. Run: pip install fastapi uvicorn")
         raise SystemExit(1)
 
-    app = create_app(api_key=args.api_key)
+    app = create_app(
+        api_key      = args.api_key,
+        cors_origins = settings.cors.origins,
+        title        = settings.api.title,
+        version      = settings.api.version,
+    )
 
     print(f"\n  Quant Fund API  →  http://{args.host}:{args.port}/docs\n")
     uvicorn.run(

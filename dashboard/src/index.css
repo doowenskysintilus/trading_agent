@@ -508,3 +508,286 @@ body {
   border-radius: var(--radius) !important;
 }
 .recharts-tooltip-label { color: var(--text-dim) !important; }
+
+/* ── Trading controls (header) ─────────────────────────────────────────── */
+.tc {
+  position:    relative;
+  display:     flex;
+  align-items: center;
+  gap:         8px;
+}
+.tc-status {
+  display:     flex;
+  align-items: center;
+  gap:         6px;
+  padding:     3px 10px;
+  border:        1px solid var(--border);
+  border-radius: var(--radius);
+  background:  var(--surface-2);
+}
+.tc-dot {
+  width:         7px;
+  height:        7px;
+  border-radius: 50%;
+  flex-shrink:   0;
+}
+.tc-label {
+  font-size:      9px;
+  letter-spacing: 1px;
+  color:          var(--text-dim);
+}
+.tc-btn {
+  padding:       4px 12px;
+  border:        1px solid var(--border-2);
+  border-radius: var(--radius);
+  background:    var(--surface-2);
+  color:         var(--text);
+  font-family:   var(--font);
+  font-size:     10px;
+  font-weight:   600;
+  letter-spacing: 1px;
+  cursor:        pointer;
+  transition:    background 0.15s, border-color 0.15s;
+}
+.tc-btn:hover:not(:disabled) { background: var(--surface-3); }
+.tc-btn:disabled             { opacity: 0.5; cursor: not-allowed; }
+.tc-btn--start    { border-color: var(--green); color: var(--green); }
+.tc-btn--start:hover:not(:disabled)    { background: rgba(34,212,106,0.15); }
+.tc-btn--stop     { border-color: var(--yellow); color: var(--yellow); }
+.tc-btn--stop:hover:not(:disabled)     { background: rgba(245,158,11,0.15); }
+.tc-btn--emergency { border-color: var(--red); color: var(--red); }
+.tc-btn--emergency:hover:not(:disabled) { background: rgba(240,64,96,0.18); }
+.tc-btn--full     { width: 100%; margin-top: 4px; padding: 8px; }
+
+/* Config popover */
+.tc-popover {
+  position:      absolute;
+  top:           calc(100% + 8px);
+  right:         0;
+  width:         360px;
+  padding:       14px;
+  background:    var(--surface);
+  border:        1px solid var(--border-2);
+  border-radius: var(--radius-lg);
+  box-shadow:    0 12px 32px rgba(0,0,0,0.5);
+  z-index:       100;
+  display:       flex;
+  flex-direction: column;
+  gap:           12px;
+}
+.tc-popover-head {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  font-size:       12px;
+  font-weight:     700;
+  letter-spacing:  1px;
+  color:           var(--text);
+  text-transform:  uppercase;
+}
+.tc-x {
+  background: none;
+  border:     none;
+  color:      var(--text-dim);
+  cursor:     pointer;
+  font-size:  13px;
+}
+.tc-x:hover { color: var(--text); }
+
+.tc-field {
+  display:        flex;
+  flex-direction: column;
+  gap:            5px;
+  flex:           1;
+}
+.tc-field > label {
+  font-size:      9px;
+  letter-spacing: 1px;
+  color:          var(--text-dim);
+  text-transform: uppercase;
+}
+.tc-row { display: flex; gap: 10px; }
+
+.tc-field input,
+.tc-field select {
+  padding:       6px 8px;
+  background:    var(--surface-2);
+  border:        1px solid var(--border-2);
+  border-radius: var(--radius);
+  color:         var(--text);
+  font-family:   var(--font);
+  font-size:     11px;
+  outline:       none;
+}
+.tc-field input:focus,
+.tc-field select:focus { border-color: var(--accent); }
+
+.tc-chips {
+  display:   flex;
+  flex-wrap: wrap;
+  gap:       4px;
+}
+.tc-chip {
+  padding:       3px 8px;
+  background:    var(--surface-2);
+  border:        1px solid var(--border-2);
+  border-radius: var(--radius);
+  color:         var(--text-dim);
+  font-family:   var(--font);
+  font-size:     10px;
+  cursor:        pointer;
+  transition:    all 0.12s;
+}
+.tc-chip:hover  { border-color: var(--accent); color: var(--text); }
+.tc-chip--on {
+  background:   rgba(0,201,167,0.15);
+  border-color: var(--accent);
+  color:        var(--accent);
+}
+
+.tc-custom { display: flex; gap: 6px; }
+.tc-custom input { flex: 1; }
+.tc-custom button {
+  padding:       0 10px;
+  background:    var(--surface-2);
+  border:        1px solid var(--border-2);
+  border-radius: var(--radius);
+  color:         var(--text-dim);
+  font-family:   var(--font);
+  font-size:     10px;
+  cursor:        pointer;
+}
+.tc-custom button:hover { border-color: var(--accent); color: var(--text); }
+
+.tc-selected { display: flex; flex-wrap: wrap; gap: 4px; }
+.tc-selected-chip {
+  padding:       2px 7px;
+  background:    rgba(0,201,167,0.12);
+  border:        1px solid var(--accent);
+  border-radius: var(--radius);
+  color:         var(--accent);
+  font-size:     10px;
+  cursor:        pointer;
+}
+.tc-selected-chip:hover { background: rgba(0,201,167,0.22); }
+
+.tc-error {
+  padding:       6px 8px;
+  background:    rgba(240,64,96,0.12);
+  border:        1px solid var(--red);
+  border-radius: var(--radius);
+  color:         var(--red);
+  font-size:     10px;
+}
+.tc-error--inline {
+  padding:    0;
+  background: none;
+  border:     none;
+  max-width:  160px;
+  overflow:   hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tc-hint {
+  font-size:  9px;
+  color:      var(--text-muted);
+  line-height: 1.4;
+}
+
+/* ---- RetrainControls ---------------------------------------------------- */
+.btn {
+  padding:        4px 12px;
+  border:         1px solid var(--border-2);
+  border-radius:  var(--radius);
+  background:     var(--surface-2);
+  color:          var(--text);
+  font-family:    var(--font);
+  font-size:      10px;
+  font-weight:    600;
+  letter-spacing: 1px;
+  cursor:         pointer;
+  transition:     background 0.15s, border-color 0.15s;
+}
+.btn:hover:not(:disabled) { background: var(--surface-3); }
+.btn:disabled             { opacity: 0.5; cursor: not-allowed; }
+.btn-accent { border-color: var(--accent); color: var(--accent); }
+.btn-accent:hover:not(:disabled) { background: rgba(0,201,167,0.15); }
+
+.retrain {
+  display:        flex;
+  flex-direction: column;
+  gap:            6px;
+  margin-bottom:  10px;
+  padding-bottom: 10px;
+  border-bottom:  1px solid var(--border);
+}
+.retrain-row {
+  display:     flex;
+  align-items: center;
+  gap:         10px;
+}
+.retrain-check {
+  display:     flex;
+  align-items: center;
+  gap:         4px;
+  font-size:   10px;
+  color:       var(--text-dim);
+  cursor:      pointer;
+}
+.retrain-err {
+  font-size: 10px;
+  color:     var(--red);
+}
+.retrain-status {
+  display:    flex;
+  flex-wrap:  wrap;
+  align-items:center;
+  gap:        8px;
+  font-size:  10px;
+  color:      var(--text-dim);
+}
+.retrain-state {
+  text-transform: uppercase;
+  font-size:      9px;
+  letter-spacing: 0.5px;
+  padding:        1px 6px;
+  border-radius:  var(--radius);
+  border:         1px solid var(--border);
+}
+.retrain-state--running { color: var(--yellow); border-color: var(--yellow); }
+.retrain-state--done    { color: var(--green);  border-color: var(--green); }
+.retrain-state--error   { color: var(--red);    border-color: var(--red); }
+.retrain-metric { color: var(--text-muted); }
+
+/* ---- RLProgressChart ---------------------------------------------------- */
+.rlp {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.rlp-head {
+  display:         flex;
+  justify-content: space-between;
+  align-items:     center;
+  margin-bottom:   4px;
+}
+.rlp-title {
+  font-size:      10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color:          var(--text-dim);
+}
+.rlp-stat {
+  font-size: 10px;
+  color:     var(--text-muted);
+}
+.rlp-chart { width: 100%; }
+.rlp-empty {
+  margin-top:    10px;
+  padding:       10px;
+  font-size:     10px;
+  color:         var(--text-muted);
+  line-height:   1.5;
+  border-top:    1px solid var(--border);
+}
+

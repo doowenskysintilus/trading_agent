@@ -289,6 +289,14 @@ class TradingMonitor:
         equity  = ps.equity  if ps else 0.0
         balance = ps.balance if ps else 0.0
 
+        # Defensive guard: a cycle without a portfolio snapshot reports
+        # equity 0, which would register a false 100% drawdown against the
+        # established high-water mark. Carry forward the last known equity.
+        if equity <= 0:
+            equity = self._high_water if self._high_water > 0 else 0.0
+        if balance <= 0:
+            balance = equity
+
         # Initialise reference values on first cycle
         if self._initial_equity == 0.0 and equity > 0:
             self._initial_equity      = equity

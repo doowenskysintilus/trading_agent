@@ -162,18 +162,40 @@ npm install
 
 ## Configuration
 
-### Environment Variables
+All settings are centralised in a single **`.env`** file at the project root and
+loaded via [`config/settings.py`](config/settings.py). Edit your values directly
+in `.env` — no code changes required:
+
+```python
+from config.settings import settings
+settings.api.port        # 8000
+settings.mt5.login       # MT5 account
+settings.cors.origins    # list of allowed origins
+```
+
+### Environment Variables (`.env`)
 
 | Variable | Description | Default |
 |---|---|---|
+| `API_HOST` / `API_PORT` | API bind host / port | `0.0.0.0` / `8000` |
+| `API_RELOAD` | Auto-reload on code change | `false` |
 | `QUANT_API_KEY` | API key for all protected endpoints | *(empty = open)* |
-| `MT5_LOGIN` | MetaTrader5 account number | — |
+| `CORS_ORIGINS` | Comma-separated allowed origins | `http://localhost:3000,...` |
+| `CORS_ALLOW_CREDENTIALS` | Allow credentials in CORS | `true` |
+| `MT5_LOGIN` | MetaTrader5 account number | *(empty = use logged-in terminal)* |
 | `MT5_PASSWORD` | MT5 password | — |
 | `MT5_SERVER` | MT5 broker server | — |
-| `MYSQL_HOST` | MySQL host | `localhost` |
-| `MYSQL_USER` | MySQL user | — |
-| `MYSQL_PASSWORD` | MySQL password | — |
+| `MT5_PATH` | Path to `terminal64.exe` | *(default terminal)* |
+| `MT5_MAGIC_NUMBER` | EA identifier on orders | `20260524` |
+| `MYSQL_ENABLED` | Enable MySQL metrics store | `false` |
+| `MYSQL_HOST` / `MYSQL_PORT` | MySQL host / port | `localhost` / `3306` |
+| `MYSQL_USER` / `MYSQL_PASSWORD` | MySQL credentials | `root` / *(empty)* |
+| `MYSQL_DATABASE` | MySQL database name | `quant_fund` |
+| `VITE_API_URL` / `VITE_WS_URL` | Dashboard API / WebSocket URLs | `http://localhost:8000` |
 | `VITE_API_KEY` | API key injected into dashboard build | — |
+
+> `.env` is git-ignored and never committed. Real environment
+> variables always take precedence over `.env` values.
 
 ---
 
@@ -182,13 +204,13 @@ npm install
 ### 1 — Start the API server
 
 ```bash
-# With auth key
-set QUANT_API_KEY=your_secret_key   # Windows
-# export QUANT_API_KEY=your_secret_key  # Linux/macOS
+# Configure everything in .env (host, port, QUANT_API_KEY, CORS, MT5…)
+python -m api.main
 
+# CLI flags still override .env if needed
 python -m api.main --host 0.0.0.0 --port 8000
 
-# Or via uvicorn directly
+# Or via uvicorn directly (reads .env through config/settings.py)
 uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 

@@ -19,11 +19,13 @@ torch>=2.2.0             # Neural network backbone (ppo_lstm_policy.py)
 gymnasium>=0.29.0        # RL environment (RLTradingEnv)
 stable-baselines3>=2.3.0 # PPO training loop (rl_trainer.py)
 sb3-contrib>=2.3.0       # RecurrentPPO with LSTM state (rl_trainer.py)
+tensorboard>=2.16.0      # RL training metrics logging (rl_trainer.py)
 
 # ── API / Web ────────────────────────────────────────────────────────────────
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0   # ASGI server with WebSocket support
 pydantic>=2.6.0
+python-dotenv>=1.0.0        # Loads .env configuration (config/settings.py)
 
 # ── Database ────────────────────────────────────────────────────────────────
 mysql-connector-python>=8.4.0   # Primary metrics store (monitoring/metrics_store.py)

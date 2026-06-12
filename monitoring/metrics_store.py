@@ -56,12 +56,24 @@ except ImportError:
 class MySQLConfig:
     host:            str = "localhost"
     port:            int = 3306
-    user:            str = "quant"
+    user:            str = "root"
     password:        str = ""
     database:        str = "quant_fund"
     pool_size:       int = 5
     connect_timeout: int = 10
     autocommit:      bool = True
+
+    @classmethod
+    def from_env(cls) -> "MySQLConfig":
+        """Build a MySQLConfig from the centralised `.env` settings."""
+        from config.settings import settings
+        return cls(
+            host     = settings.mysql.host,
+            port     = settings.mysql.port,
+            user     = settings.mysql.user,
+            password = settings.mysql.password,
+            database = settings.mysql.database,
+        )
 
 
 # ---------------------------------------------------------------------------
