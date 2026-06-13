@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import RLProgressChart from './RLProgressChart.jsx'
+import RLEnvReplay from './RLEnvReplay.jsx'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -114,6 +115,7 @@ export default function RetrainControls() {
       )}
 
       <RLProgressChart running={running} />
+      <RLEnvReplay />
     </div>
   )
 }

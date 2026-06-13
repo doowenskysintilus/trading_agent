@@ -72,9 +72,10 @@ class EmergencyStopRequest(BaseModel):
 
 class RetrainRequest(BaseModel):
     """Trigger a manual retraining of the learning models from results."""
-    train_ml:     bool = Field(default=True)
-    train_rl:     bool = Field(default=False)
-    rl_timesteps: int  = Field(default=50_000, ge=1_000, le=2_000_000)
+    train_ml:        bool = Field(default=True)
+    train_rl:        bool = Field(default=False)
+    rl_timesteps:    int  = Field(default=50_000, ge=1_000, le=2_000_000)
+    rl_history_bars: int  = Field(default=5_000, ge=200, le=100_000)
 
 
 class TradingStatusResponse(BaseModel):

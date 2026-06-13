@@ -488,7 +488,7 @@ class RLTrainer:
             features = custom_data.select_dtypes(include=[np.number]).values.astype(np.float32)
             logger.info("Using custom data: %d bars × %d features", *features.shape)
         else:
-            store = FeatureStore(root_dir=cfg.feature_store_root)
+            store = FeatureStore(root=cfg.feature_store_root)
             df = store.load(
                 symbol=cfg.symbol,
                 timeframe=cfg.timeframe,
@@ -824,3 +824,93 @@ def train_ppo_lstm(
     )
     trainer = RLTrainer(cfg)
     return trainer.fit(custom_data=data)
+
+
+# ---------------------------------------------------------------------------
+# Episode replay (for environment visualisation)
+# ---------------------------------------------------------------------------
+
+def replay_episode(
+    features: np.ndarray,
+    model_path: str,
+    *,
+    algo: str = "RecurrentPPO",
+    window_size: int = 32,
+    reward_cfg: Optional["RewardConfig"] = None,
+    initial_balance: float = 100_000.0,
+    spread: float = 0.0001,
+    sl_pct: float = 0.02,
+    tp_pct: float = 0.04,
+    position_size_pct: float = 0.10,
+    close_prices: Optional[np.ndarray] = None,
+    deterministic: bool = True,
+    max_steps: Optional[int] = None,
+) -> list[dict]:
+    """Run one full episode of a trained agent in :class:`RLTradingEnv`,
+    recording the trajectory for visualisation.
+
+    Each recorded point holds the bar index, price (the real close when
+    ``close_prices`` is given, else the env's close proxy), the action taken
+    (0=HOLD, 1=BUY, 2=SELL), the resulting position (-1/0/+1), equity and the
+    step reward. Returns the trajectory as a list of dicts.
+    """
+    if not _SB3_AVAILABLE:
+        raise ImportError("gymnasium and stable-baselines3 are required.")
+
+    env = RLTradingEnv(
+        features          = features,
+        reward_cfg        = reward_cfg or RewardConfig(),
+        window_size       = window_size,
+        initial_balance   = initial_balance,
+        spread            = spread,
+        sl_pct            = sl_pct,
+        tp_pct            = tp_pct,
+        position_size_pct = position_size_pct,
+    )
+
+    AlgoClass = RecurrentPPO if (algo == "RecurrentPPO" and _SB3_CONTRIB_AVAILABLE) else PPO
+    model = AlgoClass.load(str(model_path))
+
+    obs, _ = env.reset()
+    lstm_states = None
+    episode_starts = np.ones((1,), dtype=bool)
+
+    trajectory: list[dict] = []
+    done = False
+    step_i = 0
+
+    while not done:
+        action, lstm_states = model.predict(
+            obs,
+            state         = lstm_states,
+            episode_start = episode_starts,
+            deterministic = deterministic,
+        )
+        episode_starts = np.zeros((1,), dtype=bool)
+        act = int(np.asarray(action).reshape(-1)[0])
+
+        bar = int(env._bar)
+        obs, reward, terminated, truncated, _ = env.step(act)
+        done = bool(terminated or truncated)
+
+        if close_prices is not None and 0 <= bar < len(close_prices):
+            price = float(close_prices[bar])
+        else:
+            price = float(env._get_close(bar))
+
+        trajectory.append({
+            "step":     step_i,
+            "bar":      bar,
+            "price":    price,
+            "action":   act,
+            "position": int(env._position),
+            "equity":   float(env._equity),
+            "reward":   float(reward),
+        })
+
+        step_i += 1
+        if max_steps is not None and step_i >= max_steps:
+            break
+
+    return trajectory
+

@@ -791,3 +791,34 @@ body {
   border-top:    1px solid var(--border);
 }
 
+/* RL environment replay --------------------------------------------------- */
+.rle {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.rle-head {
+  display:     flex;
+  align-items: center;
+  gap:         10px;
+  flex-wrap:   wrap;
+  margin-bottom: 6px;
+}
+.rle-stat {
+  font-size: 10px;
+  color:     var(--text-muted);
+}
+.rle-chart { width: 100%; }
+.rle-err {
+  margin-top: 6px;
+  font-size:  10px;
+  color:      var(--red);
+}
+.rle-empty {
+  margin-top:  8px;
+  padding:     10px;
+  font-size:   10px;
+  color:       var(--text-muted);
+  line-height: 1.5;
+}
+

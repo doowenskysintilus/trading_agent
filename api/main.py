@@ -69,6 +69,57 @@ from api.dependencies import (
 
 
 # ---------------------------------------------------------------------------
+# RL feature provider
+# ---------------------------------------------------------------------------
+
+def _make_rl_feature_provider(
+    symbol: str,
+    timeframe: str,
+    n_bars: int,
+    feature_config=None,
+):
+    """Build a callable that returns a continuous feature DataFrame for RL.
+
+    Pulls ``n_bars`` recent OHLCV bars from MT5 and runs the same
+    FeatureEngineer the live trader uses, so the RL agent is trained on a
+    feature layout consistent with live inference. Returns ``None`` when MT5
+    or the feature stack is unavailable, in which case the trainer falls back
+    to the FeatureStore.
+    """
+    def _provider():
+        import pandas as pd
+        try:
+            import MetaTrader5 as mt5
+        except ImportError:
+            logger.warning("RL feature provider: MetaTrader5 unavailable.")
+            return None
+
+        from live_trading.live_trader import _get_mt5_tf
+        from research.feature_store.feature_engineer import (
+            FeatureConfig, FeatureEngineer,
+        )
+
+        rates = mt5.copy_rates_from_pos(symbol, _get_mt5_tf(timeframe), 0, n_bars)
+        if rates is None or len(rates) == 0:
+            logger.warning("RL feature provider: MT5 returned no bars for %s %s.",
+                           symbol, timeframe)
+            return None
+
+        df = pd.DataFrame(rates)
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        df = df.rename(columns={"tick_volume": "volume"}).set_index("time")
+        df.columns = [c.lower() for c in df.columns]
+
+        engineer = FeatureEngineer(feature_config or FeatureConfig())
+        features = engineer.compute(df).ffill().fillna(0.0)
+        logger.info("RL feature provider: %d bars x %d features for %s %s.",
+                    features.shape[0], features.shape[1], symbol, timeframe)
+        return features
+
+    return _provider
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -310,20 +361,34 @@ def create_app(
 
         # When the trader is running, retrain RL on its configured symbol/TF.
         rl_symbol = rl_tf = None
+        feature_config = None
         if _state.trader is not None:
             cfg = getattr(_state.trader, "cfg", None)
             if cfg is not None:
                 syms = getattr(cfg, "symbols", None)
                 rl_symbol = syms[0] if syms else None
                 rl_tf     = getattr(cfg, "timeframe", None)
+                feature_config = getattr(cfg, "feature_config", None)
+
+        # RL needs a long, continuous price-series history (not the sparse
+        # per-trade experiences). Pull recent bars from MT5 and compute the
+        # SAME features the live trader uses, so the trained agent stays
+        # consistent with live inference.
+        rl_feature_provider = _make_rl_feature_provider(
+            symbol         = rl_symbol or "EURUSD",
+            timeframe      = rl_tf or "H1",
+            n_bars         = body.rl_history_bars,
+            feature_config = feature_config,
+        )
 
         try:
             status_obj = svc.start(
-                train_ml     = body.train_ml,
-                train_rl     = body.train_rl,
-                rl_timesteps = body.rl_timesteps,
-                rl_symbol    = rl_symbol,
-                rl_timeframe = rl_tf,
+                train_ml            = body.train_ml,
+                train_rl            = body.train_rl,
+                rl_timesteps        = body.rl_timesteps,
+                rl_symbol           = rl_symbol,
+                rl_timeframe        = rl_tf,
+                rl_feature_provider = rl_feature_provider,
             )
             return ok(status_obj)
         except RuntimeError as exc:
@@ -370,7 +435,107 @@ def create_app(
 
         return ok({"points": points, "n": len(points)})
 
+    @app.get("/rl/episode", tags=["learning"], dependencies=[Auth])
+    def rl_episode(bars: int = 600, deterministic: bool = True):
+        """Replay one episode of the trained RL agent for environment
+        visualisation.
 
+        Pulls recent market history, computes the same features used in
+        training, then steps the trained agent through a fresh RLTradingEnv,
+        recording price, the action taken (HOLD/BUY/SELL), the position, and
+        equity at every bar. The dashboard plots this as price + entry/exit
+        markers + an equity curve.
+        """
+        from pathlib import Path as _Path
+        from strategies.rl_agent.rl_trainer import (
+            RLTrainerConfig, RLTradingEnv, replay_episode,
+        )
+
+        bars = max(64, min(int(bars), 20_000))
+
+        rl_cfg = RLTrainerConfig()
+        model_file = _Path(rl_cfg.model_dir) / f"{rl_cfg.model_name}.zip"
+        if not model_file.exists():
+            return ok({
+                "trajectory": [],
+                "message": "No trained RL model yet. Train it via Retrain · incl. RL.",
+            })
+
+        # Resolve symbol/timeframe/feature_config from the running trader.
+        symbol = rl_cfg.symbol
+        timeframe = rl_cfg.timeframe
+        feature_config = None
+        if _state.trader is not None:
+            cfg = getattr(_state.trader, "cfg", None)
+            if cfg is not None:
+                syms = getattr(cfg, "symbols", None)
+                symbol = (syms[0] if syms else None) or symbol
+                timeframe = getattr(cfg, "timeframe", None) or timeframe
+                feature_config = getattr(cfg, "feature_config", None)
+
+        # Fetch OHLCV + compute features, keeping the real close aligned.
+        try:
+            import MetaTrader5 as mt5
+        except ImportError:
+            return ok({"trajectory": [], "message": "MetaTrader5 unavailable."})
+
+        from live_trading.live_trader import _get_mt5_tf
+        from research.feature_store.feature_engineer import (
+            FeatureConfig, FeatureEngineer,
+        )
+
+        rates = mt5.copy_rates_from_pos(symbol, _get_mt5_tf(timeframe), 0, bars)
+        if rates is None or len(rates) == 0:
+            return ok({"trajectory": [], "message": f"MT5 returned no bars for {symbol} {timeframe}."})
+
+        import pandas as pd
+        df = pd.DataFrame(rates)
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        df = df.rename(columns={"tick_volume": "volume"}).set_index("time")
+        df.columns = [c.lower() for c in df.columns]
+
+        engineer = FeatureEngineer(feature_config or FeatureConfig())
+        feats = engineer.compute(df).ffill().fillna(0.0)
+        if len(feats) <= rl_cfg.window_size + 2:
+            return ok({"trajectory": [], "message": "Not enough bars to replay an episode."})
+
+        # Align the real close to the (NaN-dropped) feature rows.
+        close = df.loc[feats.index, "close"].to_numpy(dtype=float)
+        features = feats.to_numpy(dtype="float32")
+
+        algo = "RecurrentPPO" if rl_cfg.use_recurrent_ppo else "PPO"
+        try:
+            trajectory = replay_episode(
+                features        = features,
+                model_path      = str(model_file),
+                algo            = algo,
+                window_size     = rl_cfg.window_size,
+                reward_cfg      = rl_cfg.reward_config,
+                initial_balance = rl_cfg.initial_balance,
+                spread          = rl_cfg.spread,
+                sl_pct          = rl_cfg.sl_pct,
+                tp_pct          = rl_cfg.tp_pct,
+                position_size_pct = rl_cfg.position_size_pct,
+                close_prices    = close,
+                deterministic   = deterministic,
+            )
+        except Exception as exc:
+            logger.exception("RL episode replay failed")
+            raise HTTPException(500, f"Episode replay failed: {exc}") from exc
+
+        n_buy  = sum(1 for p in trajectory if p["action"] == 1)
+        n_sell = sum(1 for p in trajectory if p["action"] == 2)
+        final_equity = trajectory[-1]["equity"] if trajectory else rl_cfg.initial_balance
+        return ok({
+            "trajectory":      trajectory,
+            "n":               len(trajectory),
+            "symbol":          symbol,
+            "timeframe":       timeframe,
+            "initial_balance": rl_cfg.initial_balance,
+            "final_equity":    final_equity,
+            "n_buy":           n_buy,
+            "n_sell":          n_sell,
+        })
 
     @app.get("/portfolio/status", tags=["portfolio"], dependencies=[Auth])
     def portfolio_status():
