@@ -324,10 +324,13 @@ class RLTrainerConfig:
     """Hyperparameters and training settings."""
 
     # ---- Feature store --------------------------------------------------
-    feature_store_root: str  = "data/storage"
+    feature_store_root: str  = "data/storage/features"
     symbol: str              = "EURUSD"
     timeframe: str           = "H1"
     feature_version: str     = "v1"
+    # Optional hard floor for historical bars. 0 means "no extra floor"
+    # beyond the structural minimum implied by the window/splits.
+    min_history_bars: int    = 0
 
     # ---- Data splits (fraction of total) --------------------------------
     train_frac: float = 0.70
@@ -397,12 +400,14 @@ class RewardTrackingCallback(BaseCallback if _SB3_AVAILABLE else object):
     in real time and confirm the reward trends upward over training.
     """
 
-    def __init__(self, verbose: int = 0, progress_path: str | None = None) -> None:
+    def __init__(self, verbose: int = 0, progress_path: str | None = None,
+                 progress_callback=None) -> None:
         if _SB3_AVAILABLE:
             super().__init__(verbose)
         self.episode_rewards: list[float] = []
         self._ep_reward = 0.0
         self._progress_path = Path(progress_path) if progress_path else None
+        self._progress_callback = progress_callback   # callable(timesteps_done)
         if self._progress_path is not None:
             self._progress_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -431,6 +436,12 @@ class RewardTrackingCallback(BaseCallback if _SB3_AVAILABLE else object):
             recent = self.episode_rewards[-10:]
             mean_recent = float(np.mean(recent))
             self._write_progress(self.episode_rewards[-1], mean_recent)
+            # Fire external progress callback every completed episode.
+            if self._progress_callback is not None:
+                try:
+                    self._progress_callback(int(getattr(self, "num_timesteps", 0)))
+                except Exception:
+                    pass
             if self.verbose >= 1 and len(self.episode_rewards) % 10 == 0:
                 logger.info(
                     "Episode %d | mean_reward=%.4f | last=%.4f",
@@ -465,6 +476,11 @@ class RLTrainer:
         self.model = None
         self._train_env = None
         self._val_env   = None
+        self._progress_callback = None
+
+    def set_progress_callback(self, fn) -> None:
+        """Register a callable(timesteps_done) called during training."""
+        self._progress_callback = fn
 
     # ------------------------------------------------------------------
     # Data preparation
@@ -485,27 +501,66 @@ class RLTrainer:
         cfg = self.cfg
 
         if custom_data is not None:
-            features = custom_data.select_dtypes(include=[np.number]).values.astype(np.float32)
+            features = custom_data.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
+            features = features.values.astype(np.float32)
             logger.info("Using custom data: %d bars × %d features", *features.shape)
         else:
             store = FeatureStore(root=cfg.feature_store_root)
-            df = store.load(
-                symbol=cfg.symbol,
-                timeframe=cfg.timeframe,
-                version=cfg.feature_version,
-            )
+            try:
+                df = store.load(
+                    symbol=cfg.symbol,
+                    timeframe=cfg.timeframe,
+                    version=cfg.feature_version,
+                )
+            except FileNotFoundError:
+                logger.warning(
+                    "FeatureStore miss for %s/%s/%s — rebuilding from MT5.",
+                    cfg.symbol,
+                    cfg.timeframe,
+                    cfg.feature_version,
+                )
+                df = store.refresh_from_market_data(
+                    symbol=cfg.symbol,
+                    timeframe=cfg.timeframe,
+                    n_bars=max(cfg.min_history_bars, cfg.window_size * 40),
+                    version=cfg.feature_version,
+                    overwrite=True,
+                )
             # Remove OHLCV raw columns — keep only engineered features
             drop_cols = {"open", "high", "low", "close", "volume"}
             feature_cols = [c for c in df.columns if c not in drop_cols]
-            features = df[feature_cols].ffill().fillna(0).values.astype(np.float32)
+            features_df = df[feature_cols].replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
+            features = features_df.values.astype(np.float32)
             logger.info(
                 "Loaded %d bars × %d features from FeatureStore",
                 *features.shape,
             )
 
+        if not np.isfinite(features).all():
+            raise ValueError("Non-finite values found in RL feature matrix.")
+
+        min_required = max(cfg.window_size * 4, int(cfg.min_history_bars))
+        if len(features) < min_required:
+            raise ValueError(
+                f"RL history too short: got {len(features)} bars, need at least {min_required}."
+            )
+
         n = len(features)
         n_train = int(n * cfg.train_frac)
         n_val   = int(n * cfg.val_frac)
+
+        min_split = cfg.window_size + 2
+        if n_train <= min_split or n_val <= min_split:
+            # Adaptive fallback for limited history: preserve a usable
+            # validation set and allow retraining instead of hard-failing.
+            n_train = max(min_split + 1, int(n * 0.80))
+            n_val = n - n_train
+            if n_val <= min_split:
+                need = (min_split + 1) * 2
+                raise ValueError(
+                    f"RL history too short for window={cfg.window_size}: "
+                    f"got {n} bars, need at least {need}."
+                )
 
         train = features[:n_train]
         val   = features[n_train: n_train + n_val]
@@ -653,7 +708,8 @@ class RLTrainer:
                 name_prefix  = cfg.model_name,
                 verbose      = cfg.verbose,
             ),
-            RewardTrackingCallback(verbose=cfg.verbose, progress_path=cfg.progress_path),
+            RewardTrackingCallback(verbose=cfg.verbose, progress_path=cfg.progress_path,
+                                   progress_callback=self._progress_callback),
         ])
 
         logger.info("Training started — total_timesteps=%d (resumed=%s)",

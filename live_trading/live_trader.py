@@ -201,14 +201,14 @@ class LiveTraderConfig:
     # ---- Trading universe -----------------------------------------------
     symbols:   list[str] = field(default_factory=lambda: ["EURUSD"])
     timeframe: str       = "H1"
-    warmup_bars: int     = 200     # bars fetched for feature computation
+    warmup_bars: int     = 200     # 0 => auto max MT5 bars for timeframe
 
     # ---- Multi-timeframe trend filter -----------------------------------
     # Confirms each entry signal against the trend of a higher timeframe
     # (e.g. trade H1 signals only in the direction of the D1 trend).
     htf_enabled:   bool = True
     htf_timeframe: str  = ""    # "" → auto-derived from `timeframe` (+2 steps)
-    htf_bars:      int  = 200   # bars fetched on the higher timeframe
+    htf_bars:      int  = 200   # 0 => auto max MT5 bars for HTF
     htf_fast_ema:  int  = 20    # fast EMA period for the HTF trend
     htf_slow_ema:  int  = 50    # slow EMA period for the HTF trend
 
@@ -406,6 +406,7 @@ class LiveTrader:
         self._running          = False
         self._stop_event       = threading.Event()
         self._background_thread: Optional[threading.Thread] = None
+        self._auto_bars_cache: dict[tuple[str, str], int] = {}
 
         # ---- Emergency stop ---------------------------------------------
         self._emergency = EmergencyStopManager(self.cfg.stop_flag_path)
@@ -801,11 +802,18 @@ class LiveTrader:
         try:
             import MetaTrader5 as mt5
 
+            n_bars = self._resolve_fetch_bars(
+                symbol=symbol,
+                timeframe=self.cfg.timeframe,
+                requested_bars=self.cfg.warmup_bars,
+                min_bars=200,
+            )
+
             rates = mt5.copy_rates_from_pos(
                 symbol,
                 _get_mt5_tf(self.cfg.timeframe),
                 0,                          # start from the most recent
-                self.cfg.warmup_bars,
+                n_bars,
             )
             if rates is None or len(rates) == 0:
                 logger.warning("[%s] MT5 returned no data", symbol)
@@ -843,11 +851,18 @@ class LiveTrader:
         try:
             import MetaTrader5 as mt5
 
+            htf_bars = self._resolve_fetch_bars(
+                symbol=symbol,
+                timeframe=self.cfg.htf_timeframe,
+                requested_bars=self.cfg.htf_bars,
+                min_bars=max(self.cfg.htf_slow_ema + 2, 60),
+            )
+
             rates = mt5.copy_rates_from_pos(
                 symbol,
                 _get_mt5_tf(self.cfg.htf_timeframe),
                 0,
-                self.cfg.htf_bars,
+                htf_bars,
             )
             if rates is None or len(rates) < self.cfg.htf_slow_ema + 2:
                 return SignalType.HOLD
@@ -867,6 +882,71 @@ class LiveTrader:
         except Exception as exc:
             logger.warning("[%s] HTF trend computation failed: %s", symbol, exc)
             return SignalType.HOLD
+
+    def _resolve_fetch_bars(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        requested_bars: int,
+        min_bars: int,
+    ) -> int:
+        """Resolve MT5 bar count for live fetches.
+
+        requested_bars > 0: use requested value.
+        requested_bars <= 0: auto-detect max available bars for symbol/timeframe,
+        cache the result, and enforce a minimum floor.
+        """
+        req = int(requested_bars)
+        if req > 0:
+            return req
+
+        key = (symbol, timeframe.upper())
+        cached = self._auto_bars_cache.get(key)
+        if cached is not None:
+            return max(int(min_bars), int(cached))
+
+        try:
+            import MetaTrader5 as mt5
+
+            tf = _get_mt5_tf(timeframe)
+            term = mt5.terminal_info()
+            maxbars = int(getattr(term, "maxbars", 0) or 0)
+            hard_cap = maxbars if maxbars > 0 else 300_000
+
+            probes = [2_000, 10_000, 50_000, 100_000, hard_cap]
+            probes = sorted({p for p in probes if 0 < p <= hard_cap})
+
+            best = 0
+            for count in probes:
+                rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
+                got = len(rates) if rates is not None else 0
+                best = max(best, got)
+                if got < count:
+                    resolved = max(int(min_bars), int(got))
+                    self._auto_bars_cache[key] = resolved
+                    logger.info(
+                        "[%s] Auto bars resolved for %s: %d",
+                        symbol,
+                        timeframe,
+                        resolved,
+                    )
+                    return resolved
+
+            resolved = max(int(min_bars), int(best))
+            self._auto_bars_cache[key] = resolved
+            logger.info("[%s] Auto bars resolved for %s: %d", symbol, timeframe, resolved)
+            return resolved
+        except Exception as exc:
+            fallback = max(int(min_bars), 200)
+            logger.warning(
+                "[%s] Auto bars resolution failed for %s: %s (fallback=%d)",
+                symbol,
+                timeframe,
+                exc,
+                fallback,
+            )
+            return fallback
 
     # ------------------------------------------------------------------
     # ML confidence filter — hot-reload of the trained model

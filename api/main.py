@@ -72,6 +72,42 @@ from api.dependencies import (
 # RL feature provider
 # ---------------------------------------------------------------------------
 
+def _resolve_mt5_history_bars(symbol: str, timeframe: str, requested_bars: int) -> int:
+    """Resolve how many bars to request from MT5.
+
+    If ``requested_bars`` is > 0, it is used as-is.
+    If ``requested_bars`` is <= 0, this probes MT5 to estimate the maximum
+    available bars for the given symbol/timeframe (bounded by terminal maxbars).
+    """
+    if int(requested_bars) > 0:
+        return int(requested_bars)
+
+    try:
+        import MetaTrader5 as mt5
+        from live_trading.live_trader import _get_mt5_tf
+
+        tf = _get_mt5_tf(timeframe)
+        term = mt5.terminal_info()
+        maxbars = int(getattr(term, "maxbars", 0) or 0)
+        hard_cap = maxbars if maxbars > 0 else 300_000
+
+        probes = [2_000, 10_000, 50_000, 100_000, hard_cap]
+        probes = sorted({p for p in probes if p > 0 and p <= hard_cap})
+
+        best = 0
+        for count in probes:
+            rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
+            got = len(rates) if rates is not None else 0
+            best = max(best, got)
+            if got < count:
+                # Reached the actual history ceiling for this timeframe.
+                return max(200, got)
+
+        return max(200, best)
+    except Exception as exc:
+        logger.warning("RL history auto-size failed for %s %s: %s", symbol, timeframe, exc)
+        return 5_000
+
 def _make_rl_feature_provider(
     symbol: str,
     timeframe: str,
@@ -99,7 +135,8 @@ def _make_rl_feature_provider(
             FeatureConfig, FeatureEngineer,
         )
 
-        rates = mt5.copy_rates_from_pos(symbol, _get_mt5_tf(timeframe), 0, n_bars)
+        resolved_bars = _resolve_mt5_history_bars(symbol, timeframe, n_bars)
+        rates = mt5.copy_rates_from_pos(symbol, _get_mt5_tf(timeframe), 0, resolved_bars)
         if rates is None or len(rates) == 0:
             logger.warning("RL feature provider: MT5 returned no bars for %s %s.",
                            symbol, timeframe)
@@ -112,8 +149,15 @@ def _make_rl_feature_provider(
 
         engineer = FeatureEngineer(feature_config or FeatureConfig())
         features = engineer.compute(df).ffill().fillna(0.0)
-        logger.info("RL feature provider: %d bars x %d features for %s %s.",
-                    features.shape[0], features.shape[1], symbol, timeframe)
+        logger.info(
+            "RL feature provider: requested=%d resolved=%d => %d bars x %d features for %s %s.",
+            n_bars,
+            resolved_bars,
+            features.shape[0],
+            features.shape[1],
+            symbol,
+            timeframe,
+        )
         return features
 
     return _provider
@@ -344,7 +388,7 @@ def create_app(
     # ====================================================================
 
     @app.post("/rl/retrain", tags=["learning"], dependencies=[Auth])
-    def rl_retrain(body: RetrainRequest):
+    def rl_retrain(body: Optional[RetrainRequest] = None):
         """Retrain the learning models from the system's own trade results.
 
         * ML win/loss classifier — trained on collected trade experiences.
@@ -358,6 +402,8 @@ def create_app(
         if svc is None:
             svc = RetrainService()
             _state.retrain_service = svc
+
+        req = body or RetrainRequest()
 
         # When the trader is running, retrain RL on its configured symbol/TF.
         rl_symbol = rl_tf = None
@@ -377,15 +423,17 @@ def create_app(
         rl_feature_provider = _make_rl_feature_provider(
             symbol         = rl_symbol or "EURUSD",
             timeframe      = rl_tf or "H1",
-            n_bars         = body.rl_history_bars,
+            n_bars         = req.rl_history_bars,
             feature_config = feature_config,
         )
 
         try:
             status_obj = svc.start(
-                train_ml            = body.train_ml,
-                train_rl            = body.train_rl,
-                rl_timesteps        = body.rl_timesteps,
+                train_ml            = req.train_ml,
+                train_rl            = req.train_rl,
+                rl_timesteps        = req.rl_timesteps,
+                rl_continuous       = req.rl_continuous,
+                rl_interval_s       = req.rl_interval_s,
                 rl_symbol           = rl_symbol,
                 rl_timeframe        = rl_tf,
                 rl_feature_provider = rl_feature_provider,
@@ -393,6 +441,14 @@ def create_app(
             return ok(status_obj)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+
+    @app.post("/rl/stop", tags=["learning"], dependencies=[Auth])
+    def rl_stop():
+        """Request graceful stop for an active retraining loop."""
+        svc = getattr(_state, "retrain_service", None)
+        if svc is None:
+            return ok({"state": "idle", "message": "No retraining run yet."})
+        return ok(svc.stop())
 
     @app.get("/rl/status", tags=["learning"], dependencies=[Auth])
     def rl_status():
@@ -960,9 +1016,9 @@ def create_app(
         Message types sent by server
         ----------------------------
           snapshot        — full state on connect
-          tick            — equity points + portfolio + risk (every 2 s)
-          positions       — open positions table (every 10 s)
-          strategies      — per-strategy stats (every 10 s)
+                    tick            — full incremental state (every 2 s)
+                    positions       — open positions table (compat stream)
+                    strategies      — per-strategy stats (compat stream)
           heartbeat       — keep-alive ping
         """
         from api.ws import manager as _ws_manager
@@ -994,7 +1050,7 @@ def create_app(
                     websocket, "tick", _ws_build_tick(_state)
                 )
 
-                # Every 10 s: positions + strategies
+                # Compatibility stream for legacy consumers
                 if tick % 5 == 0:
                     pos  = _ws_get_positions(_state)
                     strats = _ws_get_strategies(_state)
@@ -1114,6 +1170,61 @@ def create_app(
         except Exception as exc:
             logger.warning("Could not attach monitor: %s", exc)
 
+    @app.on_event("startup")
+    def _start_rl_always_on():
+        """Keep RL retraining loop active while the API process is running."""
+        try:
+            from config.settings import settings as _cfg
+            if not _cfg.trading.rl_always_on:
+                return
+
+            from research.training.retrain_service import RetrainService
+
+            svc = getattr(_state, "retrain_service", None)
+            if svc is None:
+                svc = RetrainService()
+                _state.retrain_service = svc
+
+            # Reuse running trader context when available; otherwise defaults.
+            symbol = (_cfg.trading.symbols[0] if _cfg.trading.symbols else "EURUSD")
+            timeframe = _cfg.trading.timeframe
+            feature_config = None
+            if _state.trader is not None:
+                cfg = getattr(_state.trader, "cfg", None)
+                if cfg is not None:
+                    syms = getattr(cfg, "symbols", None)
+                    symbol = (syms[0] if syms else None) or symbol
+                    timeframe = getattr(cfg, "timeframe", None) or timeframe
+                    feature_config = getattr(cfg, "feature_config", None)
+
+            provider = _make_rl_feature_provider(
+                symbol=symbol,
+                timeframe=timeframe,
+                n_bars=_cfg.trading.rl_history_bars,
+                feature_config=feature_config,
+            )
+
+            if not svc.is_running():
+                svc.start(
+                    train_ml=False,
+                    train_rl=True,
+                    rl_timesteps=max(1_000, int(_cfg.trading.rl_timesteps)),
+                    rl_continuous=True,
+                    rl_interval_s=max(60, int(_cfg.trading.rl_interval_s)),
+                    rl_symbol=symbol,
+                    rl_timeframe=timeframe,
+                    rl_feature_provider=provider,
+                )
+                logger.info(
+                    "RL always-on loop started (symbol=%s tf=%s interval=%ss timesteps=%s).",
+                    symbol,
+                    timeframe,
+                    int(_cfg.trading.rl_interval_s),
+                    int(_cfg.trading.rl_timesteps),
+                )
+        except Exception as exc:
+            logger.warning("Could not start RL always-on loop: %s", exc)
+
     return app
 
 
@@ -1122,12 +1233,17 @@ def create_app(
 # ---------------------------------------------------------------------------
 
 def _ws_build_snapshot(state: "AppState") -> dict:
-    snap: dict = {}
+    snap: dict = {
+        "portfolio": {},
+        "equity_curve": [],
+        "recent_trades": [],
+    }
     if state.monitor:
         try:
             snap = state.monitor.get_summary()
             snap["equity_curve"]  = state.monitor.get_equity_curve(limit=300)
             snap["recent_trades"] = state.monitor.get_recent_trades(limit=50)
+            snap["portfolio"] = _ws_get_portfolio(state)
         except Exception:
             pass
     snap["positions"]  = _ws_get_positions(state)
@@ -1142,15 +1258,38 @@ def _ws_build_tick(state: "AppState") -> dict:
     if state.monitor:
         try:
             payload["equity_curve"] = state.monitor.get_equity_curve(limit=10)
-            summary = state.monitor.get_summary()
-            payload["portfolio"]   = summary.get("portfolio", {})
+            payload["portfolio"]   = _ws_get_portfolio(state)
             payload["risk"]        = state.monitor.get_latest_risk() or {}
             payload["trades"]      = state.monitor.get_recent_trades(limit=5)
         except Exception:
             pass
+    payload["positions"]  = _ws_get_positions(state)
+    payload["strategies"] = _ws_get_strategies(state)
     payload["account"] = _ws_get_account(state)
     payload["status"]  = _ws_get_status(state)
     return payload
+
+
+def _ws_get_portfolio(state: "AppState") -> dict:
+    """Normalised live portfolio snapshot for the dashboard."""
+    if state.monitor:
+        try:
+            summary = state.monitor.get_summary()
+            risk = summary.get("risk") or {}
+            dd = summary.get("drawdown") or {}
+            return {
+                "equity":       float(summary.get("equity", 0.0)),
+                "balance":      float(summary.get("balance", 0.0)),
+                "daily_pnl":    float(risk.get("daily_pnl", 0.0)),
+                "daily_pnl_pct": float(risk.get("daily_pnl_pct", 0.0)),
+                "drawdown_pct": float(dd.get("current_drawdown_pct", 0.0)),
+                "high_water":   float(dd.get("high_water_mark", 0.0)),
+                "n_positions":  int(risk.get("n_positions", 0)),
+                "risk":         risk,
+            }
+        except Exception:
+            pass
+    return {}
 
 
 def _ws_get_positions(state: "AppState") -> list:

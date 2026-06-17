@@ -43,7 +43,12 @@ class TradingStartRequest(BaseModel):
     symbols:              list[str]   = Field(default_factory=lambda: list(settings.trading.symbols))
     timeframe:            str         = Field(default_factory=lambda: settings.trading.timeframe)
     cycle_interval_s:     int         = Field(default_factory=lambda: settings.trading.cycle_seconds, ge=60, le=86400)
-    warmup_bars:          int         = Field(default_factory=lambda: settings.trading.warmup_bars, ge=50, le=5000)
+    warmup_bars:          int         = Field(
+        default_factory=lambda: settings.trading.warmup_bars,
+        ge=0,
+        le=500000,
+        description="0 = use maximum available bars for the selected timeframe",
+    )
     initial_balance:      float       = Field(default_factory=lambda: settings.trading.initial_balance, gt=0)
     allocation_method:    str         = Field(default_factory=lambda: settings.trading.allocation_method)
     htf_enabled:          bool        = Field(default_factory=lambda: settings.trading.htf_enabled)
@@ -75,7 +80,14 @@ class RetrainRequest(BaseModel):
     train_ml:        bool = Field(default=True)
     train_rl:        bool = Field(default=False)
     rl_timesteps:    int  = Field(default=50_000, ge=1_000, le=2_000_000)
-    rl_history_bars: int  = Field(default=5_000, ge=200, le=100_000)
+    rl_history_bars: int  = Field(
+        default=5_000,
+        ge=0,
+        le=500_000,
+        description="0 = use maximum available history for symbol/timeframe",
+    )
+    rl_continuous:   bool = Field(default=False)
+    rl_interval_s:   int  = Field(default=1_800, ge=60, le=86_400)
 
 
 class TradingStatusResponse(BaseModel):

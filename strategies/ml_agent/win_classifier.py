@@ -44,6 +44,8 @@ class TrainReport:
     auc:          float         = 0.0
     feature_names: list[str]    = field(default_factory=list)
     message:      str           = ""
+    warning:      str           = ""
+    reliable:     bool          = True
 
     def as_dict(self) -> dict:
         return {
@@ -55,6 +57,8 @@ class TrainReport:
             "auc":           round(self.auc, 4),
             "n_features":    len(self.feature_names),
             "message":       self.message,
+            "warning":       self.warning,
+            "reliable":      self.reliable,
         }
 
 
@@ -119,6 +123,30 @@ class WinClassifier:
         except ValueError:
             auc = 0.0
 
+        warning_parts: list[str] = []
+        reliable = True
+
+        # Tiny datasets often look "perfect" but do not generalize.
+        if n < 60:
+            reliable = False
+            warning_parts.append(
+                "Evaluation done on training data (<60 samples): metrics likely optimistic"
+            )
+
+        # Suspiciously high scores on small samples indicate overfit risk.
+        if n < 120 and (acc >= 0.95 or auc >= 0.98):
+            reliable = False
+            warning_parts.append(
+                "Overfit risk: very high metrics on a small dataset"
+            )
+
+        if n < 200:
+            warning_parts.append(
+                "Small sample: collect more closed trades for stable ML filter"
+            )
+
+        warning = "; ".join(warning_parts)
+
         self._model = model
         self._feature_names = list(feature_names)
         self._save()
@@ -130,6 +158,8 @@ class WinClassifier:
             trained=True, n_samples=n, n_wins=n_wins, n_losses=n_losses,
             accuracy=acc, auc=auc, feature_names=self._feature_names,
             message="Model trained and saved.",
+            warning=warning,
+            reliable=reliable,
         )
 
     # ------------------------------------------------------------------

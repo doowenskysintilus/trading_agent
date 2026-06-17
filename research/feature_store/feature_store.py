@@ -230,6 +230,50 @@ class FeatureStore:
 
         return df
 
+    def refresh_from_market_data(
+        self,
+        symbol: str,
+        timeframe: str,
+        n_bars: int = 5_000,
+        version: Optional[str] = None,
+        overwrite: bool = True,
+    ) -> pd.DataFrame:
+        """Fetch recent OHLCV bars from MT5, compute features and persist them.
+
+        This keeps the time-series cache self-healing: when the stored feature
+        set is missing or stale, the caller can rebuild the series from the
+        market source used by live trading.
+        """
+        from live_trading.data_feed import DataFeed, DataFeedConfig
+
+        feed = DataFeed(DataFeedConfig(default_bars=n_bars))
+        connected = feed.connect()
+        try:
+            if not connected:
+                raise RuntimeError("MetaTrader5 connection unavailable.")
+
+            raw = feed.fetch_ohlcv(symbol=symbol, timeframe=timeframe, n_bars=n_bars)
+            if raw is None or raw.empty:
+                raise RuntimeError(f"No OHLCV bars returned for {symbol}/{timeframe}.")
+
+            features = self.build(
+                raw,
+                symbol=symbol,
+                timeframe=timeframe,
+                version=version,
+                overwrite=overwrite,
+            )
+            logger.info(
+                "Refreshed feature cache from market data for %s/%s with %d bars.",
+                symbol,
+                timeframe,
+                len(raw),
+            )
+            return features
+        finally:
+            if connected:
+                feed.disconnect()
+
     def delete(self, symbol: str, timeframe: str, version: Optional[str] = None) -> None:
         """Remove a cached feature set from disk and manifest."""
         ver  = version or self.version

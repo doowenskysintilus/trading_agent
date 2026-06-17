@@ -167,6 +167,21 @@ class TradingSettings:
         default_factory=lambda: _get_float("TRADING_ML_MIN_WIN_PROBA", 0.50)
     )
 
+    # ---- RL always-on background retraining -----------------------------
+    # Keep RL retraining loop running as long as the API process is alive.
+    rl_always_on: bool = field(
+        default_factory=lambda: _get_bool("TRADING_RL_ALWAYS_ON", True)
+    )
+    rl_interval_s: int = field(
+        default_factory=lambda: _get_int("TRADING_RL_INTERVAL_S", 300)
+    )
+    rl_timesteps: int = field(
+        default_factory=lambda: _get_int("TRADING_RL_TIMESTEPS", 50_000)
+    )
+    rl_history_bars: int = field(
+        default_factory=lambda: _get_int("TRADING_RL_HISTORY_BARS", 0)
+    )
+
 
 @dataclass(frozen=True)
 class MySQLSettings:

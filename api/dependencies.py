@@ -169,34 +169,49 @@ def get_app_state() -> AppState:
 
 try:
     from fastapi import Depends, HTTPException
-
-    def _state() -> AppState:
-        return _app_state
-
-    def require_trader(state: AppState = Depends(_state)) -> Any:
-        if state.trader is None:
-            raise HTTPException(503, "LiveTrader not initialised.")
-        return state.trader
-
-    def require_monitor(state: AppState = Depends(_state)) -> Any:
-        if state.monitor is None:
-            raise HTTPException(503, "TradingMonitor not initialised.")
-        return state.monitor
-
-    def require_execution(state: AppState = Depends(_state)) -> Any:
-        if state.execution_engine is None:
-            raise HTTPException(503, "ExecutionEngine not initialised.")
-        return state.execution_engine
-
-    def require_risk(state: AppState = Depends(_state)) -> Any:
-        if state.risk_engine is None:
-            raise HTTPException(503, "RiskEngine not initialised.")
-        return state.risk_engine
-
-    def require_backtest(state: AppState = Depends(_state)) -> Any:
-        if state.backtest_engine is None:
-            raise HTTPException(503, "BacktestEngine not initialised.")
-        return state.backtest_engine
-
+    _FASTAPI_DEPENDENCIES_OK = True
 except ImportError:
-    pass
+    _FASTAPI_DEPENDENCIES_OK = False
+
+    class HTTPException(Exception):
+        def __init__(self, status_code: int, detail: str):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    def Depends(value):  # type: ignore[override]
+        return value
+
+
+def _state() -> AppState:
+    return _app_state
+
+
+def require_trader(state: AppState = Depends(_state)) -> Any:
+    if state.trader is None:
+        raise HTTPException(503, "LiveTrader not initialised.")
+    return state.trader
+
+
+def require_monitor(state: AppState = Depends(_state)) -> Any:
+    if state.monitor is None:
+        raise HTTPException(503, "TradingMonitor not initialised.")
+    return state.monitor
+
+
+def require_execution(state: AppState = Depends(_state)) -> Any:
+    if state.execution_engine is None:
+        raise HTTPException(503, "ExecutionEngine not initialised.")
+    return state.execution_engine
+
+
+def require_risk(state: AppState = Depends(_state)) -> Any:
+    if state.risk_engine is None:
+        raise HTTPException(503, "RiskEngine not initialised.")
+    return state.risk_engine
+
+
+def require_backtest(state: AppState = Depends(_state)) -> Any:
+    if state.backtest_engine is None:
+        raise HTTPException(503, "BacktestEngine not initialised.")
+    return state.backtest_engine

@@ -48,6 +48,7 @@ export default function TradingControls({ running, emergency }) {
   const [timeframe,  setTimeframe]  = useState('H1')
   const [interval,   setInterval]   = useState(3600)
   const [warmupBars, setWarmupBars] = useState(200)
+  const [useMaxBars, setUseMaxBars] = useState(false)
   const [balance,    setBalance]    = useState(100000)
   const [allocation, setAllocation] = useState('RISK_PARITY')
   const [htfEnabled,   setHtfEnabled]   = useState(true)
@@ -122,7 +123,7 @@ export default function TradingControls({ running, emergency }) {
     // sent as 0 and rejected by the API (cycle ≥ 60, balance > 0 → 422).
     const cycle = Math.min(Math.max(Number(interval) || 0, 60), 86400)
     const bal   = Number(balance) > 0 ? Number(balance) : 100000
-    const bars  = Math.min(Math.max(Number(warmupBars) || 0, 50), 5000)
+    const bars  = useMaxBars ? 0 : Math.min(Math.max(Number(warmupBars) || 0, 50), 500000)
     try {
       await callApi('/trading/start', {
         symbols,
@@ -138,7 +139,7 @@ export default function TradingControls({ running, emergency }) {
       })
       setOpen(false)
     } catch { /* error already surfaced */ }
-  }, [callApi, symbols, timeframe, interval, warmupBars, balance, allocation, htfEnabled, htfTimeframe, mlEnabled, mlMinWin])
+  }, [callApi, symbols, timeframe, interval, warmupBars, useMaxBars, balance, allocation, htfEnabled, htfTimeframe, mlEnabled, mlMinWin])
 
   const handleStop = useCallback(async () => {
     try {
@@ -250,10 +251,20 @@ export default function TradingControls({ running, emergency }) {
               <input
                 type="number"
                 min={50}
-                max={5000}
+                max={500000}
                 value={warmupBars}
+                disabled={useMaxBars}
                 onChange={(e) => setWarmupBars(e.target.value)}
               />
+              <label style={{ marginTop: 6, display: 'block' }}>
+                <input
+                  type="checkbox"
+                  checked={useMaxBars}
+                  onChange={(e) => setUseMaxBars(e.target.checked)}
+                  style={{ marginRight: 6, verticalAlign: 'middle' }}
+                />
+                Max available (timeframe)
+              </label>
             </div>
           </div>
 

@@ -52,8 +52,9 @@ export default function App() {
   const mergeTrades = useCallback((incoming = []) => {
     if (!incoming.length) return
     setTrades((prev) => {
-      const seen  = new Set(prev.map((t) => `${t.ts}|${t.symbol}`))
-      const fresh = incoming.filter((t) => !seen.has(`${t.ts}|${t.symbol}`))
+      const tradeKey = (t) => `${t.ticket ?? ''}|${t.ts}|${t.symbol}|${t.strategy ?? ''}|${t.pnl ?? ''}`
+      const seen  = new Set(prev.map((t) => tradeKey(t)))
+      const fresh = incoming.filter((t) => !seen.has(tradeKey(t)))
       if (!fresh.length) return prev
       return [...fresh, ...prev].slice(0, 200)
     })
@@ -86,7 +87,13 @@ export default function App() {
         if (payload.portfolio)    setPortfolio(payload.portfolio)
         if (payload.risk)         setRisk(payload.risk)
         if (payload.trades)       mergeTrades(payload.trades)
+        if (Array.isArray(payload.positions)) setPositions(payload.positions)
+        if (Array.isArray(payload.strategies)) setStrategies(payload.strategies)
         if (payload.account && Object.keys(payload.account).length) setAccount(payload.account)
+        if (payload.status) {
+          if (typeof payload.status.running === 'boolean') setRunning(payload.status.running)
+          if (typeof payload.status.emergency_active === 'boolean') setEmergency(payload.status.emergency_active)
+        }
         break
 
       case 'positions':
