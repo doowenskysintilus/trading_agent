@@ -187,6 +187,8 @@ settings.cors.origins    # list of allowed origins
 | `MT5_SERVER` | MT5 broker server | — |
 | `MT5_PATH` | Path to `terminal64.exe` | *(default terminal)* |
 | `MT5_MAGIC_NUMBER` | EA identifier on orders | `20260524` |
+| `TRADING_SL_ATR_MULTIPLIER` | SL distance = ATR × multiplier | `2.0` |
+| `TRADING_TP_ATR_MULTIPLIER` | TP distance = ATR × multiplier | `4.0` |
 | `MYSQL_ENABLED` | Enable MySQL metrics store | `false` |
 | `MYSQL_HOST` / `MYSQL_PORT` | MySQL host / port | `localhost` / `3306` |
 | `MYSQL_USER` / `MYSQL_PASSWORD` | MySQL credentials | `root` / *(empty)* |
@@ -263,6 +265,83 @@ trader.start_background()
 uvicorn.run(app, host="0.0.0.0", port=8000)
 ```
 
+### 4 — Dashboard: Configure & Control Trading
+
+Once the API and dashboard are running, open http://localhost:3000 to start live trading.
+
+#### Start Trading Panel
+
+Click **▶ START** to open the configuration panel. Set your trading parameters:
+
+- **Pairs**: Select or add FX / metals pairs (e.g. EURUSD, GBPUSD)
+- **Timeframe**: Trading timeframe (M1, M5, H1, H4, D1, etc.)
+- **Cycle**: How often the system checks for signals (seconds)
+- **Bars**: Historical bars to warm up features (0 = max available)
+- **Initial Balance**: Starting equity
+- **Allocation**: Position sizing method (Risk Parity, Equal Weight, Kelly, etc.)
+- **Multi-timeframe filter**: Optional trend confirmation on higher timeframe
+- **ML win filter**: Optional machine-learning classifier for trade confidence
+- **SL ATR multiplier** ⭐: Stop-loss distance = ATR × multiplier (1.0 to 5.0)  
+  - _Lower values = tighter stops, higher win rate but smaller average winner_
+- **TP ATR multiplier** ⭐: Take-profit distance = ATR × multiplier (1.0 to 5.0)  
+  - _Higher values = room for trending moves, lower frequency of TPs hit_
+
+Once configured, click **▶ Start Autonomous Trading**. The system immediately begins:
+- Streaming real-time market data
+- Computing features + signals
+- Sizing + executing orders with your SL/TP multipliers
+- Broadcasting live updates to the dashboard
+
+#### Example: SL/TP Multiplier Impact
+
+| SL Mult | TP Mult | SL Impact | TP Impact |
+|---------|---------|-----------|-----------|
+| 1.0 | 4.0 | Tight stops | Aggressive profit target |
+| 2.0 | 4.0 | **Default** — balanced risk | **Default** — standard reward |
+| 3.0 | 5.0 | Loose stops | Extra room for trends |
+
+### Dashboard Components
+
+- **PnL Chart**: Real-time equity curve with drawdown
+- **Strategy Comparison**: Bar chart per strategy + cumulative stats
+- **Open Positions**: Live positions with P&L, entry price, strategy
+- **Risk Status**: Current risk level, capital utilization, verdict (GREEN/YELLOW/RED)
+- **Trades Feed**: Live trade execution feed with flash highlight
+
+---
+
+## Live Trading Configuration (API)
+
+### POST `/trading/start`
+
+```bash
+curl -X POST http://localhost:8000/trading/start \
+  -H "Authorization: Bearer your_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "symbols": ["EURUSD", "GBPUSD"],
+    "timeframe": "H1",
+    "cycle_interval_s": 3600,
+    "warmup_bars": 200,
+    "initial_balance": 100000,
+    "allocation_method": "RISK_PARITY",
+    "htf_enabled": true,
+    "htf_timeframe": "D1",
+    "ml_filter_enabled": true,
+    "ml_min_win_proba": 0.50,
+    "sl_atr_multiplier": 2.0,
+    "tp_atr_multiplier": 4.0
+  }'
+```
+
+**New parameters** (SL/TP control):
+- `sl_atr_multiplier` (float, default 2.0): SL distance as ATR multiple (1.0–5.0)
+- `tp_atr_multiplier` (float, default 4.0): TP distance as ATR multiple (1.0–5.0)
+
+These multipliers are applied to every trade placed by the system:
+- **SL price** = `entry_price ± ATR × sl_atr_multiplier` (sign depends on direction)
+- **TP price** = `entry_price ± ATR × tp_atr_multiplier`
+
 ---
 
 ## API Endpoints
@@ -275,6 +354,7 @@ All endpoints require `Authorization: Bearer <key>` or `X-API-Key: <key>`
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/health` | Liveness probe (no auth) |
+| `GET` | `/trading/config` | Default trading parameters from `.env` |
 | `POST` | `/trading/start` | Start live trading loop |
 | `POST` | `/trading/stop` | Graceful stop |
 | `POST` | `/trading/emergency_stop` | Immediate halt + cancel orders |
