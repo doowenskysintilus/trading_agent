@@ -236,6 +236,8 @@ class LiveTraderConfig:
 
     # ---- Risk engine ----------------------------------------------------
     risk_config: RiskConfig = field(default_factory=RiskConfig)
+    sl_atr_multiplier: float = 2.0
+    tp_atr_multiplier: float = 4.0
 
     # ---- Portfolio allocation -------------------------------------------
     allocation_method: AllocationMethod = AllocationMethod.RISK_PARITY
@@ -1033,7 +1035,8 @@ class LiveTrader:
         # ATR-based stop distance. The RiskEngine re-caps this in Layer 4.
         risk_cfg    = self._risk_engine.config
         risk_amount = equity * risk_cfg.risk_per_trade_pct
-        sl_distance = max(atr_proxy * risk_cfg.atr_multiplier, 1e-9)
+        sl_distance = max(atr_proxy * self.cfg.sl_atr_multiplier, 1e-9)
+        tp_distance = max(atr_proxy * self.cfg.tp_atr_multiplier, 1e-9)
         size        = round(risk_amount / sl_distance, 2)
 
         return TradeOrder(
@@ -1043,6 +1046,8 @@ class LiveTrader:
             size        = size,
             entry_price = entry_price,
             atr         = atr_proxy,
+            stop_loss   = round(entry_price - direction * sl_distance, 5),
+            take_profit = round(entry_price + direction * tp_distance, 5),
         )
 
     def _apply_risk(self, order: TradeOrder) -> RiskDecision:
@@ -1205,7 +1210,8 @@ class LiveTrader:
                 self._portfolio_state.open_positions = [
                     OpenPosition(
                         symbol        = p.symbol,
-                        strategy      = "live",
+                        strategy      = ", ".join(self._open_trades.get(p.ticket, {}).get("strategies", []))
+                                       if self._open_trades.get(p.ticket, {}).get("strategies") else "live",
                         direction     = p.direction,
                         size          = p.volume,
                         entry_price   = p.open_price,
@@ -1225,6 +1231,36 @@ class LiveTrader:
                             {k: round(v, 0) for k, v in result.allocations.items()})
         except Exception as exc:
             logger.warning("Rebalance failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Open position helpers
+    # ------------------------------------------------------------------
+
+    def get_live_positions(self) -> list[dict]:
+        """Return open MT5 positions enriched with strategy attribution."""
+        positions = self._exec_engine.get_open_positions()
+        result: list[dict] = []
+        for p in positions:
+            info = self._open_trades.get(p.ticket, {})
+            strategies = info.get("strategies")
+            strategy_label = (
+                ", ".join(strategies)
+                if isinstance(strategies, list) and strategies else "live"
+            )
+            result.append({
+                "ticket":        p.ticket,
+                "symbol":        p.symbol,
+                "direction":     p.direction,
+                "volume":        p.volume,
+                "open_price":    p.open_price,
+                "current_price": p.current_price,
+                "sl":            p.sl,
+                "tp":            p.tp,
+                "profit":        p.profit,
+                "magic":         p.magic,
+                "strategy":      strategy_label,
+            })
+        return result
 
     # ------------------------------------------------------------------
     # Closed-trade reconciliation — the learning feedback loop

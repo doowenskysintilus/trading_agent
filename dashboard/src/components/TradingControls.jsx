@@ -55,6 +55,8 @@ export default function TradingControls({ running, emergency }) {
   const [htfTimeframe, setHtfTimeframe] = useState('')
   const [mlEnabled,    setMlEnabled]    = useState(true)
   const [mlMinWin,     setMlMinWin]     = useState(0.50)
+  const [slMultiplier, setSlMultiplier] = useState(2.0)
+  const [tpMultiplier, setTpMultiplier] = useState(4.0)
 
   // Pre-fill the panel with the defaults configured in .env (server-side).
   useEffect(() => {
@@ -74,6 +76,8 @@ export default function TradingControls({ running, emergency }) {
         if (typeof cfg.htf_timeframe === 'string') setHtfTimeframe(cfg.htf_timeframe)
         if (typeof cfg.ml_filter_enabled === 'boolean') setMlEnabled(cfg.ml_filter_enabled)
         if (typeof cfg.ml_min_win_proba === 'number') setMlMinWin(cfg.ml_min_win_proba)
+        if (typeof cfg.sl_atr_multiplier === 'number') setSlMultiplier(cfg.sl_atr_multiplier)
+        if (typeof cfg.tp_atr_multiplier === 'number') setTpMultiplier(cfg.tp_atr_multiplier)
       })
       .catch(() => { /* keep hardcoded fallbacks */ })
     return () => { cancelled = true }
@@ -136,6 +140,8 @@ export default function TradingControls({ running, emergency }) {
         htf_timeframe: htfTimeframe,
         ml_filter_enabled: mlEnabled,
         ml_min_win_proba:  Math.min(Math.max(Number(mlMinWin) || 0, 0), 1),
+        sl_atr_multiplier: Math.min(Math.max(Number(slMultiplier) || 2.0, 1.0), 5.0),
+        tp_atr_multiplier: Math.min(Math.max(Number(tpMultiplier) || 4.0, 1.0), 5.0),
       })
       setOpen(false)
     } catch { /* error already surfaced */ }
@@ -336,6 +342,31 @@ export default function TradingControls({ running, emergency }) {
                 value={mlMinWin}
                 disabled={!mlEnabled}
                 onChange={(e) => setMlMinWin(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div className="tc-row">
+            <div className="tc-field">
+              <label>SL ATR multiplier</label>
+              <input
+                type="number"
+                min={1}
+                max={5}
+                step={0.1}
+                value={slMultiplier}
+                onChange={(e) => setSlMultiplier(e.target.value)}
+              />
+            </div>
+            <div className="tc-field">
+              <label>TP ATR multiplier</label>
+              <input
+                type="number"
+                min={1}
+                max={5}
+                step={0.1}
+                value={tpMultiplier}
+                onChange={(e) => setTpMultiplier(e.target.value)}
               />
             </div>
           </div>

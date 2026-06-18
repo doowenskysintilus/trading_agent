@@ -30,10 +30,17 @@ export default function PositionsTable({ positions }) {
 }
 
 function PositionRow({ pos: p }) {
-  const isBuy   = (p.direction ?? '').toUpperCase() === 'BUY'
-  const pnl     = p.unrealized_pnl ?? p.pnl ?? 0
+  const dir     = toDirection(p.direction ?? p.side ?? p.signal)
+  const isBuy   = dir === 'BUY'
+  const size    = pickNum(p.size, p.volume, p.lot, p.quantity)
+  const entry   = pickNum(p.entry_price, p.open_price, p.price_open, p.entry)
+  const current = pickNum(p.current_price, p.price_current, p.price)
+  const pnl     = pickNum(p.unrealized_pnl, p.profit, p.pnl) ?? 0
   const pnlPct  = p.pnl_pct ?? 0
   const isProfit = pnl >= 0
+  const strategy = Array.isArray(p.strategy)
+    ? p.strategy.join(', ')
+    : p.strategy
 
   return (
     <tr className="pos-row">
@@ -45,11 +52,11 @@ function PositionRow({ pos: p }) {
         </span>
       </td>
 
-      <td className="num">{p.size ?? p.volume ?? '—'}</td>
+      <td className="num">{size != null ? size : '—'}</td>
 
-      <td className="num align-right">{fmtPrice(p.entry_price ?? p.open_price)}</td>
+      <td className="num align-right">{fmtPrice(entry)}</td>
 
-      <td className="num align-right">{fmtPrice(p.current_price ?? p.price)}</td>
+      <td className="num align-right">{fmtPrice(current)}</td>
 
       <td className={`num align-right pnl-cell ${isProfit ? 'profit' : 'loss'}`}>
         {isProfit ? '+' : ''}${Math.abs(pnl).toFixed(2)}
@@ -60,7 +67,7 @@ function PositionRow({ pos: p }) {
         )}
       </td>
 
-      <td className="pos-strategy">{p.strategy ?? '—'}</td>
+      <td className="pos-strategy">{strategy ?? '—'}</td>
     </tr>
   )
 }
@@ -72,4 +79,21 @@ function PositionRow({ pos: p }) {
 function fmtPrice(p) {
   if (p == null) return '—'
   return p >= 100 ? p.toFixed(2) : p.toFixed(5)
+}
+
+function pickNum(...vals) {
+  for (const v of vals) {
+    if (v == null || v === '') continue
+    const n = Number(v)
+    if (!Number.isNaN(n) && Number.isFinite(n)) return n
+  }
+  return null
+}
+
+function toDirection(v) {
+  if (typeof v === 'number') return v >= 0 ? 'BUY' : 'SELL'
+  const s = String(v ?? '').trim().toUpperCase()
+  if (s === '1' || s === '+1' || s === 'BUY' || s === 'LONG') return 'BUY'
+  if (s === '-1' || s === 'SELL' || s === 'SHORT') return 'SELL'
+  return 'SELL'
 }

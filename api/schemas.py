@@ -56,6 +56,8 @@ class TradingStartRequest(BaseModel):
     verbose_signals:      bool        = Field(default_factory=lambda: settings.trading.verbose_signals)
     ml_filter_enabled:    bool        = Field(default_factory=lambda: settings.trading.ml_filter_enabled)
     ml_min_win_proba:     float       = Field(default_factory=lambda: settings.trading.ml_min_win_proba, ge=0.0, le=1.0)
+    sl_atr_multiplier:   float       = Field(default_factory=lambda: settings.trading.sl_atr_multiplier, ge=1.0, le=5.0)
+    tp_atr_multiplier:   float       = Field(default_factory=lambda: settings.trading.tp_atr_multiplier, ge=1.0, le=5.0)
 
     class Config:
         json_schema_extra = {
@@ -63,6 +65,8 @@ class TradingStartRequest(BaseModel):
                 "symbols": ["EURUSD", "GBPUSD"],
                 "timeframe": "H1",
                 "cycle_interval_s": 3600,
+                "sl_atr_multiplier": 2.0,
+                "tp_atr_multiplier": 4.0,
             }
         }
 
@@ -136,6 +140,23 @@ class EquityPoint(BaseModel):
     open_pnl:     float
     drawdown_pct: float
     n_positions:  int
+
+
+class EconomicEventResponse(BaseModel):
+    timestamp: str
+    country:   str
+    name:      str
+    importance: str
+    forecast:  Optional[float] = None
+    previous:  Optional[float] = None
+    actual:    Optional[float] = None
+    revised:   Optional[float] = None
+    units:     Optional[str] = None
+    url:       Optional[str] = None
+
+
+class CalendarEventsResponse(BaseModel):
+    events: list[EconomicEventResponse] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

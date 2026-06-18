@@ -166,11 +166,17 @@ class TradingSettings:
     ml_min_win_proba: float = field(
         default_factory=lambda: _get_float("TRADING_ML_MIN_WIN_PROBA", 0.50)
     )
+    sl_atr_multiplier: float = field(
+        default_factory=lambda: _get_float("TRADING_SL_ATR_MULTIPLIER", 2.0)
+    )
+    tp_atr_multiplier: float = field(
+        default_factory=lambda: _get_float("TRADING_TP_ATR_MULTIPLIER", 4.0)
+    )
 
     # ---- RL always-on background retraining -----------------------------
     # Keep RL retraining loop running as long as the API process is alive.
     rl_always_on: bool = field(
-        default_factory=lambda: _get_bool("TRADING_RL_ALWAYS_ON", True)
+        default_factory=lambda: _get_bool("TRADING_RL_ALWAYS_ON", False)
     )
     rl_interval_s: int = field(
         default_factory=lambda: _get_int("TRADING_RL_INTERVAL_S", 300)
@@ -180,6 +186,32 @@ class TradingSettings:
     )
     rl_history_bars: int = field(
         default_factory=lambda: _get_int("TRADING_RL_HISTORY_BARS", 0)
+    )
+
+    # ---- Economic Calendar (Phase 1) ------------------------------------
+    include_calendar_features: bool = field(
+        default_factory=lambda: _get_bool("TRADING_INCLUDE_CALENDAR_FEATURES", False)
+    )
+    calendar_source: str = field(
+        default_factory=lambda: _get_str("TRADING_CALENDAR_SOURCE", "mock")
+    )
+    calendar_api_key: str = field(
+        default_factory=lambda: _get_str("TRADING_CALENDAR_API_KEY", "")
+    )
+
+
+@dataclass(frozen=True)
+class RiskEngineSettings:
+    """Risk engine configuration (event-aware sizing, blackout controls)."""
+    
+    event_blackout_enabled: bool = field(
+        default_factory=lambda: _get_bool("RISK_EVENT_BLACKOUT_ENABLED", True)
+    )
+    event_blackout_hours: float = field(
+        default_factory=lambda: _get_float("RISK_EVENT_BLACKOUT_HOURS", 0.5)
+    )
+    event_vol_multiplier: float = field(
+        default_factory=lambda: _get_float("RISK_EVENT_VOL_MULTIPLIER", 1.5)
     )
 
 
@@ -223,6 +255,7 @@ class Settings:
     trading: TradingSettings = field(default_factory=TradingSettings)
     mysql: MySQLSettings = field(default_factory=MySQLSettings)
     dashboard: DashboardSettings = field(default_factory=DashboardSettings)
+    risk_engine: RiskEngineSettings = field(default_factory=RiskEngineSettings)
 
     env_file: str = field(default_factory=lambda: str(ENV_PATH))
     env_file_loaded: bool = field(default_factory=lambda: _DOTENV_OK and ENV_PATH.exists())

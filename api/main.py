@@ -60,12 +60,14 @@ from api.schemas      import (
     ManualTradeRequest, ClosePositionRequest, TradeExecutionResponse,
     RiskStatusResponse, RiskConfigUpdate, DrawdownPeriod,
     RetrainRequest,
+    EconomicEventResponse, CalendarEventsResponse,
 )
 from api.dependencies import (
     AppState, BacktestJob,
     get_app_state, require_trader, require_monitor,
     require_execution, require_backtest,
 )
+from research.feature_store.calendar_provider import CalendarProvider, EventImportance
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +288,8 @@ def create_app(
                 verbose_signals        = body.verbose_signals,
                 ml_filter_enabled      = body.ml_filter_enabled,
                 ml_min_win_proba       = body.ml_min_win_proba,
+                sl_atr_multiplier      = body.sl_atr_multiplier,
+                tp_atr_multiplier      = body.tp_atr_multiplier,
                 # MT5 credentials sourced from .env (optional — an
                 # already-logged-in terminal works without them).
                 mt5_login    = settings.mt5.login,
@@ -381,6 +385,8 @@ def create_app(
             "htf_timeframe":     _cfg.trading.htf_timeframe,
             "ml_filter_enabled": _cfg.trading.ml_filter_enabled,
             "ml_min_win_proba":  _cfg.trading.ml_min_win_proba,
+            "sl_atr_multiplier": _cfg.trading.sl_atr_multiplier,
+            "tp_atr_multiplier": _cfg.trading.tp_atr_multiplier,
         })
 
     # ====================================================================
@@ -630,6 +636,43 @@ def create_app(
             data = _state.monitor.get_equity_curve(limit=limit)
         return ok(data)
 
+    @app.get("/calendar/events", tags=["calendar"], dependencies=[Auth])
+    def calendar_events(
+        next_n_hours: int = Query(72, ge=1, le=168),
+        source: Optional[str] = Query(None, description="Override calendar source"),
+        importance: str = Query("MEDIUM", pattern="^(LOW|MEDIUM|HIGH)$"),
+        countries: Optional[str] = Query(None, description="Comma-separated country codes"),
+    ):
+        """Upcoming economic calendar events."""
+        from config.settings import settings as _cfg
+
+        provider = CalendarProvider(source or _cfg.trading.calendar_source)
+        min_importance = EventImportance[importance.upper()]
+        country_list = [c.strip().upper() for c in (countries or "").split(",") if c.strip()]
+
+        events = provider.get_upcoming_events(
+            next_n_hours=next_n_hours,
+            countries=country_list or None,
+            min_importance=min_importance,
+        )
+
+        payload = [
+            {
+                "timestamp": e.timestamp.isoformat(),
+                "country": e.country,
+                "name": e.name,
+                "importance": e.importance.name,
+                "forecast": e.forecast,
+                "previous": e.previous,
+                "actual": e.actual,
+                "revised": e.revised,
+                "units": e.units,
+                "url": e.url,
+            }
+            for e in events
+        ]
+        return ok({"events": payload})
+
     @app.get("/portfolio/account", tags=["portfolio"], dependencies=[Auth])
     def portfolio_account():
         """Real MT5 account info: balance, equity, margin, currency, leverage.
@@ -825,7 +868,10 @@ def create_app(
         if _state.execution_engine is None:
             raise HTTPException(503, "ExecutionEngine not initialised.")
         try:
-            positions = _state.execution_engine.get_open_positions()
+            if _state.trader is not None and hasattr(_state.trader, "get_live_positions"):
+                positions = _state.trader.get_live_positions()
+            else:
+                positions = _state.execution_engine.get_open_positions()
             return ok(positions)
         except Exception as exc:
             raise HTTPException(500, str(exc)) from exc
@@ -1108,8 +1154,9 @@ def create_app(
         try:
             from strategies.momentum.momentum_alpha import MomentumAlpha
             from strategies.mean_reversion.mean_reversion_alpha import MeanReversionAlpha
+            from strategies.economic_alpha.calendar_alpha import CalendarAlpha
 
-            for model in (MomentumAlpha(), MeanReversionAlpha()):
+            for model in (MomentumAlpha(), MeanReversionAlpha(), CalendarAlpha()):
                 _state.register_strategy(model.name, model)
             logger.info(
                 "Default strategies registered: %s",
@@ -1293,6 +1340,11 @@ def _ws_get_portfolio(state: "AppState") -> dict:
 
 
 def _ws_get_positions(state: "AppState") -> list:
+    if state.trader is not None and hasattr(state.trader, "get_live_positions"):
+        try:
+            return state.trader.get_live_positions()
+        except Exception:
+            pass
     if state.execution_engine:
         try:
             return state.execution_engine.get_open_positions()

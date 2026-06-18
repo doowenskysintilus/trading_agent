@@ -72,7 +72,13 @@ export default function RetrainControls() {
       })
       const d = await r.json()
       if (!r.ok || d?.success === false) {
-        throw new Error(d?.error || d?.detail || `HTTP ${r.status}`)
+        const raw = String(d?.error || d?.detail || `HTTP ${r.status}`)
+        if (r.status === 409 || raw.toLowerCase().includes('already in progress')) {
+          // Sync UI with active run when backend reports a lock.
+          await fetchStatus()
+          throw new Error('A retraining run is already active. Click Stop or wait for completion.')
+        }
+        throw new Error(raw)
       }
       setStatus(d.data)
     } catch (e) {

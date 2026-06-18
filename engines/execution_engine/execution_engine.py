@@ -177,6 +177,7 @@ class PositionInfo:
     tp: float
     profit: float
     magic: int
+    strategy: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +509,7 @@ class MT5ExecutionEngine:
                 tp            = p.tp,
                 profit        = p.profit,
                 magic         = p.magic,
+                strategy      = None,
             ))
 
         return result

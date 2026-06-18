@@ -12,15 +12,24 @@ Supported features
 - Volatility ATR : atr, natr (normalised)
 - Volume         : volume_change, volume_zscore
 - Bollinger      : bb_upper, bb_lower, bb_width, bb_pct
+- Economic       : event_is_active, event_hours_until, event_vol_expectation (optional)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
+
+try:
+    from .calendar_provider import CalendarProvider, EventImportance
+    _CALENDAR_AVAILABLE = True
+except ImportError:
+    _CALENDAR_AVAILABLE = False
+    CalendarProvider = None
+    EventImportance = None
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +69,10 @@ class FeatureConfig:
     # Volume
     volume_window: int = 20
 
+    # Economic Calendar (Phase 1: add event features)
+    include_calendar_features: bool = False
+    calendar_source: str = "mock"  # "mock", "cache", "fred", "trading_economics"
+
     # Drop NaN rows created by long-period indicators
     dropna: bool = True
 
@@ -90,7 +103,12 @@ class FeatureEngineer:
     # Public API
     # ------------------------------------------------------------------
 
-    def compute(self, data: pd.DataFrame) -> pd.DataFrame:
+    def compute(
+        self,
+        data: pd.DataFrame,
+        symbol: Optional[str] = None,
+        calendar_provider: Optional[CalendarProvider] = None,
+    ) -> pd.DataFrame:
         """
         Compute all features from a raw OHLCV DataFrame.
 
@@ -98,6 +116,11 @@ class FeatureEngineer:
         ----------
         data : pd.DataFrame
             Must contain lowercase columns: open, high, low, close, volume.
+        symbol : str, optional
+            Trading pair (e.g., "EURUSD") for calendar features.
+        calendar_provider : CalendarProvider, optional
+            Provider for economic event data. If None and
+            include_calendar_features=True, will auto-create from config.
 
         Returns
         -------
@@ -187,6 +210,17 @@ class FeatureEngineer:
         for col in ["open", "high", "low", "close", "volume"]:
             features[col] = df[col].astype(float)
 
+        # ---- Economic Calendar features (optional) ---------------------
+        if self.config.include_calendar_features and _CALENDAR_AVAILABLE:
+            if calendar_provider is None and symbol:
+                # Auto-create provider from config
+                calendar_provider = CalendarProvider(source=self.config.calendar_source)
+            
+            if calendar_provider and symbol:
+                features = self._add_calendar_features(
+                    features, calendar_provider, symbol, df
+                )
+
         if cfg.dropna:
             features = features.dropna()
 
@@ -195,15 +229,15 @@ class FeatureEngineer:
     @property
     def feature_names(self) -> list[str]:
         """Return the list of output feature column names (requires one compute call)."""
-        return list(self.compute(
-            pd.DataFrame({
-                "open":   np.random.rand(100) + 100,
-                "high":   np.random.rand(100) + 101,
-                "low":    np.random.rand(100) + 99,
-                "close":  np.random.rand(100) + 100,
-                "volume": np.random.rand(100) * 1000,
-            })
-        ).columns)
+        dummy_data = pd.DataFrame({
+            "open":   np.random.rand(100) + 100,
+            "high":   np.random.rand(100) + 101,
+            "low":    np.random.rand(100) + 99,
+            "close":  np.random.rand(100) + 100,
+            "volume": np.random.rand(100) * 1000,
+        })
+        features = self.compute(dummy_data, symbol="EURUSD")
+        return list(features.columns)
 
     # ------------------------------------------------------------------
     # Indicator implementations
@@ -249,6 +283,66 @@ class FeatureEngineer:
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
+
+    def _add_calendar_features(
+        self,
+        features: pd.DataFrame,
+        calendar_provider: CalendarProvider,
+        symbol: str,
+        original_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Add economic calendar features to the feature matrix.
+        
+        Adds columns:
+        - event_is_active : bool (is a HIGH-impact event happening now?)
+        - event_hours_until : float (hours until next event, or 999 if none)
+        - event_vol_expectation : float (expected vol multiplier 1.0 - 1.5)
+        
+        Parameters
+        ----------
+        features : pd.DataFrame
+            Current feature matrix to augment
+        calendar_provider : CalendarProvider
+            Provider for event data
+        symbol : str
+            Trading pair
+        original_df : pd.DataFrame
+            Original OHLCV data (for timestamps if available)
+        
+        Returns
+        -------
+        pd.DataFrame
+            Feature matrix with calendar columns added
+        """
+        try:
+            # Compute calendar features for each row
+            # For MVP, use current time for all rows (static snapshot)
+            is_active = calendar_provider.event_is_active(symbol, window_minutes=30)
+            hours_until = calendar_provider.hours_until_next_event(
+                symbol, min_importance=EventImportance.MEDIUM
+            ) or 999.0
+            vol_mult = calendar_provider.expected_volatility_multiplier(
+                symbol, window_hours=2.0
+            )
+            
+            # Broadcast to all rows
+            features["event_is_active"] = float(is_active)
+            features["event_hours_until"] = min(hours_until, 999.0)  # Cap at 999
+            features["event_vol_expectation"] = vol_mult
+            
+            return features
+        
+        except Exception as e:
+            # Graceful fallback if calendar provider fails
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Calendar feature computation failed: {e}. Skipping.")
+            # Fill with neutral values
+            features["event_is_active"] = 0.0
+            features["event_hours_until"] = 999.0
+            features["event_vol_expectation"] = 1.0
+            return features
 
     @staticmethod
     def _validate(df: pd.DataFrame) -> None:

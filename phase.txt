@@ -1,1 +1,48 @@
+========== ECONOMIC CALENDAR INTEGRATION ==========
+
+Phase 1 (COMPLETED ✓): Event Awareness Foundation
+- CalendarProvider with mock data source (4 synthetic events, 48-hour window)
+- FeatureEngineer augmented with 3 calendar columns
+  • event_is_active (binary)
+  • event_hours_until (0-999)
+  • event_vol_expectation (1.0-1.5x multiplier)
+- RiskEngine Layer 0 (Event Blackout) prevents trades during events
+- RiskEngine Layer 4 (Volatility Scaling) reduces position size by ~33% during events
+- Configuration via .env (TRADING_INCLUDE_CALENDAR_FEATURES=true)
+- Tests: 5/5 passing
+
+Phase 3 (COMPLETED ✓): CalendarAlpha Strategy
+- CalendarAlpha class with post-event reversal logic
+  • BUY if Actual > Forecast (beat consensus)
+  • SELL if Actual < Forecast (miss consensus)
+  • Pre-event weak signals based on beat probability
+- Auto-registration in api/main.py (3/3 strategies: momentum + mean_reversion + calendar_alpha)
+- Tests: 5/5 passing (init, signals, auto-reg, event-aware, metadata)
+- Documentation: PHASE3_CALENDAR_ALPHA_STRATEGY.md
+
+Phase 2 (READY ★): Real Calendar Data Integration
+- Phase 2A: Real calendar APIs
+  • FRED integration (US economic indicators)
+  • Trading Economics integration (global calendars)
+  • Caching layer (Redis fallback)
+  • Fallback strategy (real API → cache → mock)
+- Phase 2B: RL Environment Augmentation
+  • Augment TradingEnv with 3 calendar observation columns
+  • Retrain PPO/LSTM on calendar-aware experiences
+  • Backtest comparison (expect 20%+ DD reduction)
+- Phase 2C: Dashboard Integration
+  • Event countdown widget (next 5 events in 24h)
+  • Calendar-segmented metrics (during/pre/quiet events)
+  • Event PnL heatmap
+- Planning doc: PHASE2_REAL_CALENDAR_PLAN.md
+- Estimated timeline: 4-6 weeks
+
+Phase 2 Original (différée): RL Online Learning
+- Retraining from live trading results
+- IMPALA implementation for distributed learning
+- Integrated with new Phase 2B calendar features
+- Deferred until Phase 2B augmentation complete
+
+========== ECONOMIC CALENDAR INTEGRATION ==========
+
 Phase 2 (différée) : apprentissage en ligne de l'agent RL (réentraînement depuis les résultats live); Faut un modele RL et un modele ML en parallele. faut utiliser IMPALA faut aussi l'environnement RL. pour les données collectées je pense qu'on devrait avoir des données complets que sur les ordres placé et aussi le résultats de ces trades afin d'évité d'avoir trop de données inutile il faut collecter des données pouvant aider les modèles à etre performant. l'echel de la courbe reste à 10 meme si la ligne monte ou déscend

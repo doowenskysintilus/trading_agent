@@ -4,20 +4,22 @@ RiskEngine
 Hedge fund-grade global risk engine.
 
 Evaluates proposed trades against live portfolio state across six
-independent risk layers. Returns APPROVE / REDUCE / BLOCK.
+independent risk layers (plus Layer 0: economic calendar blackout).
+Returns APPROVE / REDUCE / BLOCK.
 
 Risk layers (evaluated in order — first block wins)
 ----------------------------------------------------
+0. Event Blackout       emergency gate on major economic events
 1. Kill Switch          hard circuit-breaker on daily loss / drawdown
 2. Drawdown Control     portfolio-wide HWM drawdown ceiling
 3. Exposure Limits      per-asset and per-strategy notional caps
-4. Volatility Sizing    ATR-adjusted max position size
+4. Volatility Sizing    ATR-adjusted max position size (event-aware)
 5. Correlation Risk     portfolio-level concentration check
 6. Leverage Check       total gross exposure vs equity
 
 Entry point
 -----------
-    engine = RiskEngine(config=RiskConfig())
+    engine = RiskEngine(config=RiskConfig(), calendar_provider=None)
     decision = engine.evaluate_portfolio_risk(trades, portfolio_state)
 """
 
@@ -30,6 +32,19 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+
+try:
+    from research.feature_store.calendar_provider import CalendarProvider, EventImportance
+    _CALENDAR_AVAILABLE = True
+except ImportError:
+    try:
+        # Fallback for relative imports
+        from ..research.feature_store.calendar_provider import CalendarProvider, EventImportance
+        _CALENDAR_AVAILABLE = True
+    except ImportError:
+        _CALENDAR_AVAILABLE = False
+        CalendarProvider = None
+        EventImportance = None
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +70,7 @@ class RejectReason(str, Enum):
     CORRELATION_CONCENTRATION  = "correlation_concentration"
     LEVERAGE_EXCEEDED          = "leverage_exceeded"
     INSUFFICIENT_BALANCE       = "insufficient_balance"
+    EVENT_BLACKOUT             = "event_blackout"  # Economic event blackout
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +108,11 @@ class RiskConfig:
 
     # --- REDUCE sizing (when soft limit hit) --------------------------------
     reduce_factor: float            = 0.50   # reduce proposed size by this factor
+
+    # --- Economic Calendar (Phase 1) ----------------------------------------
+    event_blackout_enabled: bool    = True   # enable blackout around major events
+    event_blackout_hours: float     = 0.5    # don't trade within 30 min of event
+    event_vol_multiplier: float     = 1.5    # scale ATR by this during events
 
 
 # ---------------------------------------------------------------------------
@@ -234,10 +255,17 @@ class RiskEngine:
     ----------
     config : RiskConfig
         All configurable thresholds.
+    calendar_provider : CalendarProvider, optional
+        Economic calendar provider for event-aware sizing. If None, Layer 0 is skipped.
     """
 
-    def __init__(self, config: RiskConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: RiskConfig | None = None,
+        calendar_provider: Optional[CalendarProvider] = None,
+    ) -> None:
         self.config = config or RiskConfig()
+        self.calendar_provider = calendar_provider
         self._kill_switch_active: bool = False
 
     # ------------------------------------------------------------------
@@ -266,6 +294,33 @@ class RiskEngine:
         checks: list[RiskCheckResult] = []
         approved: list[TradeOrder] = []
         blocked:  list[TradeOrder] = []
+
+        # ---- Layer 0: Economic Event Blackout (pre-check) ----------------
+        # If enabled and calendar available, check for nearby major events
+        if self.config.event_blackout_enabled and self.calendar_provider and _CALENDAR_AVAILABLE:
+            event_blocked = []
+            for trade in trades:
+                event_check = self._check_event_blackout(trade)
+                checks.append(event_check)
+                if not event_check.passed:
+                    event_blocked.append(trade)
+            
+            if event_blocked:
+                logger.info(
+                    "EVENT BLACKOUT: %d trade(s) blocked due to nearby economic events",
+                    len(event_blocked)
+                )
+                blocked.extend(event_blocked)
+                trades = [t for t in trades if t not in event_blocked]
+            
+            # If all trades blocked, return early
+            if not trades:
+                return RiskDecision(
+                    verdict=RiskVerdict.BLOCK,
+                    blocked_trades=blocked,
+                    checks=checks,
+                    metadata={"event_blackout": True},
+                )
 
         # ---- Layer 1: Kill switch (portfolio-wide) ----------------------
         ks_check = self._check_kill_switch(portfolio_state)
@@ -384,8 +439,65 @@ class RiskEngine:
             },
         )
 
+    # ------------------------------------------------------------------    # Layer 0 — Economic Event Blackout
     # ------------------------------------------------------------------
-    # Layer 1 — Kill switch
+
+    def _check_event_blackout(self, trade: TradeOrder) -> RiskCheckResult:
+        """
+        Check if there's a high-impact economic event near the trade time.
+        
+        If event_blackout_enabled and calendar_provider is active:
+        - BLOCK trades if event within blackout_hours
+        - Returns reason EVENT_BLACKOUT on reject
+        """
+        cfg = self.config
+        
+        if not cfg.event_blackout_enabled or not self.calendar_provider:
+            return RiskCheckResult(
+                name="event_blackout",
+                passed=True,
+                verdict=RiskVerdict.APPROVE,
+            )
+        
+        try:
+            # Check if a high-impact event is happening or about to happen
+            hours_until = self.calendar_provider.hours_until_next_event(
+                trade.symbol,
+                min_importance=EventImportance.HIGH if _CALENDAR_AVAILABLE else None,
+            )
+            
+            if hours_until is None:
+                # No upcoming events
+                return RiskCheckResult(
+                    name="event_blackout",
+                    passed=True,
+                    verdict=RiskVerdict.APPROVE,
+                )
+            
+            if hours_until <= cfg.event_blackout_hours:
+                return RiskCheckResult(
+                    name="event_blackout",
+                    passed=False,
+                    verdict=RiskVerdict.BLOCK,
+                    reason=RejectReason.EVENT_BLACKOUT,
+                    message=(
+                        f"High-impact event in {hours_until:.2f}h ≤ "
+                        f"blackout {cfg.event_blackout_hours:.2f}h — "
+                        f"trade blocked for {trade.symbol}"
+                    ),
+                )
+        except Exception as e:
+            logger.warning(f"Event blackout check failed: {e}. Allowing trade.")
+            # Graceful fallback: don't block on provider errors
+            pass
+        
+        return RiskCheckResult(
+            name="event_blackout",
+            passed=True,
+            verdict=RiskVerdict.APPROVE,
+        )
+
+    # ------------------------------------------------------------------    # Layer 1 — Kill switch
     # ------------------------------------------------------------------
 
     def _check_kill_switch(self, ps: PortfolioState) -> RiskCheckResult:
@@ -555,7 +667,21 @@ class RiskEngine:
 
         # ATR-based max size: risk_pct × equity / (ATR × multiplier)
         risk_budget   = ps.equity * cfg.risk_per_trade_pct
-        sl_distance   = trade.atr * cfg.atr_multiplier
+        
+        # Event-aware ATR adjustment (Phase 1)
+        atr_multiplier = cfg.atr_multiplier
+        if cfg.event_blackout_enabled and self.calendar_provider and _CALENDAR_AVAILABLE:
+            try:
+                event_vol_mult = self.calendar_provider.expected_volatility_multiplier(
+                    trade.symbol, window_hours=2.0
+                )
+                # Scale the ATR multiplier by event expectation
+                # E.g., 1.5x event vol mult → 1.5x larger SL distance → smaller position
+                atr_multiplier = cfg.atr_multiplier * event_vol_mult
+            except Exception as e:
+                logger.debug(f"Event vol multiplier failed: {e}. Using base atr_multiplier.")
+        
+        sl_distance   = trade.atr * atr_multiplier
         vol_max_size  = risk_budget / (sl_distance + 1e-10)
 
         # Hard cap
@@ -570,7 +696,8 @@ class RiskEngine:
                 reason=RejectReason.VOLATILITY_SIZE_TOO_LARGE,
                 message=(
                     f"Size {size:.4f} > vol-adjusted max {max_allowed:.4f} "
-                    f"(ATR={trade.atr:.5f}, risk_budget={risk_budget:.2f})"
+                    f"(ATR={trade.atr:.5f}, atr_mult={atr_multiplier:.2f}, "
+                    f"risk_budget={risk_budget:.2f})"
                 ),
                 suggested_size=round(max_allowed, 6),
             )

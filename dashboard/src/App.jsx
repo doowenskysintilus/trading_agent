@@ -4,6 +4,7 @@ import StrategyComparison from './components/StrategyComparison.jsx'
 import PositionsTable     from './components/PositionsTable.jsx'
 import RiskStatus         from './components/RiskStatus.jsx'
 import TradesFeed         from './components/TradesFeed.jsx'
+import EconomicCalendar   from './components/EconomicCalendar.jsx'
 import TradingControls    from './components/TradingControls.jsx'
 import RetrainControls    from './components/RetrainControls.jsx'
 import useWebSocket       from './hooks/useWebSocket.js'
@@ -12,6 +13,7 @@ import useWebSocket       from './hooks/useWebSocket.js'
 // Config — override with VITE_API_KEY env var if needed
 // ---------------------------------------------------------------------------
 const API_KEY = import.meta.env.VITE_API_KEY ?? ''
+const AUTH_HEADERS = API_KEY ? { 'X-API-Key': API_KEY } : {}
 const WS_URL  = (() => {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const host  = window.location.host
@@ -36,6 +38,34 @@ export default function App() {
   const [emergency,  setEmergency]  = useState(false)       // emergency stop engaged
 
   const { lastMessage, status } = useWebSocket(WS_URL)
+
+  // ---- Normalise positions payloads from WS/REST ---------------------
+  const setPositionsSafe = useCallback((incoming) => {
+    const raw = Array.isArray(incoming)
+      ? incoming
+      : Array.isArray(incoming?.positions)
+        ? incoming.positions
+        : []
+
+    const normalized = raw
+      .filter(Boolean)
+      .map((p) => ({
+        ...p,
+        // Preserve both formats used by backend structs and ad-hoc payloads.
+        size: p.size ?? p.volume ?? p.lot ?? p.quantity ?? null,
+        entry_price: p.entry_price ?? p.open_price ?? p.price_open ?? p.entry ?? null,
+        current_price: p.current_price ?? p.price_current ?? p.price ?? p.current ?? null,
+        unrealized_pnl: p.unrealized_pnl ?? p.profit ?? p.pnl ?? null,
+      }))
+
+    // Merge with previous snapshot so a partial payload does not blank cells.
+    // Also keep a stable order (ticket/symbol) to prevent row remount flicker.
+    setPositions((prev) => {
+      const next = mergePositions(prev, normalized)
+      if (samePositions(prev, next)) return prev
+      return next
+    })
+  }, [])
 
   // ---- Deduplicate equity points by ts --------------------------------
   const mergeEquity = useCallback((incoming = []) => {
@@ -72,8 +102,9 @@ export default function App() {
         if (payload.portfolio)     setPortfolio(payload.portfolio)
         if (payload.strategies?.strategies) setStrategies(payload.strategies.strategies)
         else if (Array.isArray(payload.strategies)) setStrategies(payload.strategies)
-        if (payload.positions?.positions) setPositions(payload.positions.positions)
-        else if (Array.isArray(payload.positions)) setPositions(payload.positions)
+        if (Object.prototype.hasOwnProperty.call(payload, 'positions')) {
+          setPositionsSafe(payload.positions)
+        }
         if (payload.risk)          setRisk(payload.risk)
         if (payload.account && Object.keys(payload.account).length) setAccount(payload.account)
         if (payload.status) {
@@ -87,7 +118,9 @@ export default function App() {
         if (payload.portfolio)    setPortfolio(payload.portfolio)
         if (payload.risk)         setRisk(payload.risk)
         if (payload.trades)       mergeTrades(payload.trades)
-        if (Array.isArray(payload.positions)) setPositions(payload.positions)
+        if (Object.prototype.hasOwnProperty.call(payload, 'positions')) {
+          setPositionsSafe(payload.positions)
+        }
         if (Array.isArray(payload.strategies)) setStrategies(payload.strategies)
         if (payload.account && Object.keys(payload.account).length) setAccount(payload.account)
         if (payload.status) {
@@ -97,7 +130,7 @@ export default function App() {
         break
 
       case 'positions':
-        setPositions(payload.positions ?? [])
+        setPositionsSafe(payload.positions)
         break
 
       case 'strategies':
@@ -123,7 +156,36 @@ export default function App() {
       default:
         break
     }
-  }, [lastMessage, mergeEquity, mergeTrades])
+  }, [lastMessage, mergeEquity, mergeTrades, setPositionsSafe])
+
+  // ---- REST fallback for real-time open positions --------------------
+  // WebSocket remains the primary channel; this lightweight poll keeps the
+  // positions panel fresh if tick cadence is low or one frame is missed.
+  useEffect(() => {
+    let timer = null
+    let active = true
+
+    const refreshOpenPositions = async () => {
+      try {
+        const r = await fetch('/api/trades/open', { headers: AUTH_HEADERS })
+        const d = await r.json()
+        if (!active) return
+        if (r.ok && d?.success !== false) {
+          setPositionsSafe(d?.data ?? [])
+        }
+      } catch {
+        // Keep last known snapshot; WS updates continue independently.
+      }
+    }
+
+    refreshOpenPositions()
+    timer = setInterval(refreshOpenPositions, status === 'connected' ? 3000 : 8000)
+
+    return () => {
+      active = false
+      if (timer) clearInterval(timer)
+    }
+  }, [status, setPositionsSafe])
 
   // ---- Derived values -------------------------------------------------
   // Prefer the REAL MT5 account figures when connected; otherwise fall back
@@ -216,6 +278,13 @@ export default function App() {
           </div>
         </section>
 
+        <section className="panel panel-calendar">
+          <PanelHeader title="Economic Calendar" />
+          <div className="panel-body panel-body--scroll">
+            <EconomicCalendar />
+          </div>
+        </section>
+
         <section className="panel panel-positions">
           <PanelHeader title={`Open Positions (${n_positions})`} />
           <div className="panel-body panel-body--scroll">
@@ -284,4 +353,60 @@ function fmt(n) {
   if (Math.abs(n) >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
   if (Math.abs(n) >= 10_000)    return (n / 1_000).toFixed(1) + 'K'
   return Number(n).toFixed(2)
+}
+
+function samePositions(a = [], b = []) {
+  if (a.length !== b.length) return false
+  const key = (p) => [
+    p.ticket ?? '',
+    p.symbol ?? '',
+    p.direction ?? p.side ?? '',
+    p.size ?? p.volume ?? '',
+    p.entry_price ?? p.open_price ?? '',
+    p.current_price ?? p.price_current ?? p.price ?? '',
+    p.unrealized_pnl ?? p.profit ?? p.pnl ?? '',
+  ].join('|')
+
+  for (let i = 0; i < a.length; i += 1) {
+    if (key(a[i]) !== key(b[i])) return false
+  }
+  return true
+}
+
+function mergePositions(prev = [], incoming = []) {
+  const byKey = new Map()
+
+  for (const p of prev) {
+    byKey.set(positionKey(p), p)
+  }
+
+  for (const p of incoming) {
+    const key = positionKey(p)
+    const old = byKey.get(key)
+    byKey.set(key, {
+      ...old,
+      ...p,
+      // Keep previous non-null values when new frame omits a field.
+      size: coalesce(p.size, old?.size),
+      entry_price: coalesce(p.entry_price, old?.entry_price),
+      current_price: coalesce(p.current_price, old?.current_price),
+      unrealized_pnl: coalesce(p.unrealized_pnl, old?.unrealized_pnl),
+    })
+  }
+
+  return Array.from(byKey.values()).sort((x, y) => {
+    const tx = Number(x.ticket ?? Number.MAX_SAFE_INTEGER)
+    const ty = Number(y.ticket ?? Number.MAX_SAFE_INTEGER)
+    if (tx !== ty) return tx - ty
+    return String(x.symbol ?? '').localeCompare(String(y.symbol ?? ''))
+  })
+}
+
+function positionKey(p) {
+  if (p?.ticket != null) return `t:${p.ticket}`
+  return `s:${p?.symbol ?? ''}|d:${p?.direction ?? p?.side ?? ''}`
+}
+
+function coalesce(nextVal, prevVal) {
+  return nextVal == null ? prevVal ?? null : nextVal
 }

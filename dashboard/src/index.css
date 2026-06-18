@@ -174,11 +174,12 @@ body {
 .grid {
   display:               grid;
   grid-template-columns: 1fr 280px;
-  grid-template-rows:    1fr 270px 180px;
+  grid-template-rows:    1fr 220px 180px 180px;
   grid-template-areas:
     "chart    risk"
-    "strategy positions"
-    "trades   trades";
+    "strategy calendar"
+    "positions trades"
+    "positions trades";
   gap:     8px;
   padding: 8px;
   flex:    1;
@@ -189,8 +190,13 @@ body {
 .panel-chart     { grid-area: chart;     }
 .panel-risk      { grid-area: risk;      }
 .panel-strategy  { grid-area: strategy;  }
+.panel-calendar  { grid-area: calendar;  }
 .panel-positions { grid-area: positions; }
 .panel-trades    { grid-area: trades;    }
+
+.panel-calendar .panel-body {
+  padding: 0;
+}
 
 /* ── Panel ─────────────────────────────────────────────────────────────── */
 .panel {
