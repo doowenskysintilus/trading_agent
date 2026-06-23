@@ -2,9 +2,7 @@ import { useEffect, useState } from 'react'
 import { format, parseISO, isValid } from 'date-fns'
 
 import './EconomicCalendar.css'
-
-const API_KEY = import.meta.env.VITE_API_KEY ?? ''
-const AUTH_HEADERS = API_KEY ? { 'X-API-Key': API_KEY } : {}
+import { AUTH_HEADERS, buildApiPath } from '../apiConfig.js'
 
 export default function EconomicCalendar() {
   const [events, setEvents] = useState([])
@@ -19,7 +17,7 @@ export default function EconomicCalendar() {
       setError(null)
 
       try {
-        const response = await fetch('/api/calendar/events?next_n_hours=72', {
+        const response = await fetch(buildApiPath('/api/calendar/events?next_n_hours=72'), {
           headers: AUTH_HEADERS,
         })
         const payload = await response.json()

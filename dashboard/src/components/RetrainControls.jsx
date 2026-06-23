@@ -1,16 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import RLProgressChart from './RLProgressChart.jsx'
 import RLEnvReplay from './RLEnvReplay.jsx'
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-const API_KEY = import.meta.env.VITE_API_KEY ?? ''
-
-const AUTH_HEADERS = {
-  'Content-Type': 'application/json',
-  ...(API_KEY ? { 'X-API-Key': API_KEY } : {}),
-}
+import { AUTH_HEADERS, buildApiPath } from '../apiConfig.js'
 
 // ---------------------------------------------------------------------------
 // RetrainControls
@@ -30,7 +21,7 @@ export default function RetrainControls() {
 
   const fetchStatus = useCallback(async () => {
     try {
-      const r = await fetch('/api/rl/status', { headers: AUTH_HEADERS })
+      const r = await fetch(buildApiPath('/api/rl/status'), { headers: AUTH_HEADERS })
       const d = await r.json()
       if (d?.data) setStatus(d.data)
       return d?.data
@@ -65,9 +56,9 @@ export default function RetrainControls() {
         body.rl_interval_s = intervalS
         body.rl_history_bars = useMaxHistory ? 0 : historyBars
       }
-      const r = await fetch('/api/rl/retrain', {
+      const r = await fetch(buildApiPath('/api/rl/retrain'), {
         method:  'POST',
-        headers: AUTH_HEADERS,
+        headers: { 'Content-Type': 'application/json', ...AUTH_HEADERS },
         body:    JSON.stringify(body),
       })
       const d = await r.json()
@@ -92,9 +83,9 @@ export default function RetrainControls() {
     setBusy(true)
     setError('')
     try {
-      const r = await fetch('/api/rl/stop', {
+      const r = await fetch(buildApiPath('/api/rl/stop'), {
         method:  'POST',
-        headers: AUTH_HEADERS,
+        headers: { 'Content-Type': 'application/json', ...AUTH_HEADERS },
       })
       const d = await r.json()
       if (!r.ok || d?.success === false) {

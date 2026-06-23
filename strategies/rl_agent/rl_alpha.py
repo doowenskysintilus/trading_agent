@@ -23,6 +23,9 @@ import pandas as pd
 
 from research.alpha_models.base import AlphaModel, AlphaSignal, SignalType
 
+import logging
+logger = logging.getLogger(__name__)
+
 # SB3 imports are optional — codebase can be imported without SB3 installed.
 try:
     from stable_baselines3.common.policies import BasePolicy
@@ -87,12 +90,37 @@ class RLAlpha(AlphaModel):
         self._lstm_states: Optional[tuple] = None
         self._episode_starts: Optional[np.ndarray] = None
 
+        self._model_path: Optional[Path] = Path(model_path) if model_path else None
+        self._algo = algo
+        self._model_mtime: float = 0.0
+
         if model_path is not None:
             self.load(model_path, algo)
 
     # ------------------------------------------------------------------
     # Model management
     # ------------------------------------------------------------------
+
+    def maybe_reload(self) -> None:
+        """Hot-reload the model when its file changes on disk.
+
+        Called once per compute() so a freshly retrained model (from
+        /rl/retrain) is picked up without restarting the live trader.
+        """
+        if self._model_path is None:
+            return
+        try:
+            mtime = self._model_path.stat().st_mtime
+        except OSError:
+            return
+        if mtime <= self._model_mtime:
+            return
+        try:
+            self.load(self._model_path, self._algo)
+            self._model_mtime = mtime
+            logger.info("RLAlpha: model reloaded from %s (mtime=%.0f).", self._model_path, mtime)
+        except Exception as exc:
+            logger.warning("RLAlpha: hot-reload failed — %s", exc)
 
     def load(self, model_path: str | Path, algo: str = "PPO") -> None:
         """Load a trained SB3 / sb3-contrib model from disk."""
@@ -116,6 +144,14 @@ class RLAlpha(AlphaModel):
             self._model        = algo_class.load(str(model_path))
             self._is_recurrent = False
 
+        # Track mtime so maybe_reload() can detect future changes.
+        self._model_path = Path(model_path)
+        self._algo = algo
+        try:
+            self._model_mtime = self._model_path.stat().st_mtime
+        except OSError:
+            self._model_mtime = 0.0
+
         # Initialise LSTM state for first inference call
         self._reset_lstm_state()
 
@@ -132,6 +168,7 @@ class RLAlpha(AlphaModel):
         self._reset_lstm_state()
 
     def compute(self, data: pd.DataFrame) -> AlphaSignal:
+        self.maybe_reload()
         if not self.is_loaded:
             return self._hold(reason="model_not_loaded")
 
@@ -214,14 +251,23 @@ class RLAlpha(AlphaModel):
 
                 probs = distribution.distribution.probs.squeeze().cpu().numpy()
 
-            # Confidence = action probability, scaled so HOLD doesn't dominate
+            # Confidence for non-HOLD actions:
+            # We want a score that reflects BOTH how likely this action is
+            # AND how much the model prefers it over HOLD.
+            # Raw formula: (p_action / non_hold) can over-amplify weak signals
+            # when hold_prob ≈ 1.  We multiply back by non_hold so very
+            # HOLD-dominant models produce low confidence for their signals.
             action_prob = float(np.clip(probs[action], 0.0, 1.0))
 
-            # For non-HOLD actions: normalise relative to HOLD probability
             if action != 0:
-                hold_prob = float(probs[0])
-                non_hold  = 1.0 - hold_prob + 1e-8
-                action_prob = float(np.clip(probs[action] / non_hold, 0.0, 1.0))
+                hold_prob   = float(probs[0])
+                non_hold    = 1.0 - hold_prob + 1e-8
+                relative    = float(np.clip(probs[action] / non_hold, 0.0, 1.0))
+                # Penalise when HOLD dominates: multiply by (non_hold / 0.5)
+                # so that a non_hold of 0.5 (equal chance of hold vs non-hold)
+                # gives no penalty, while non_hold < 0.5 reduces confidence.
+                hold_penalty = float(np.clip(non_hold / 0.5, 0.0, 1.0))
+                action_prob  = float(np.clip(relative * hold_penalty, 0.0, 1.0))
 
             return action_prob
         except Exception:

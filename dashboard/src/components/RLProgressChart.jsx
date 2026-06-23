@@ -3,12 +3,7 @@ import {
   LineChart, Line, XAxis, YAxis,
   CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts'
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-const API_KEY = import.meta.env.VITE_API_KEY ?? ''
-const AUTH_HEADERS = API_KEY ? { 'X-API-Key': API_KEY } : {}
+import { AUTH_HEADERS, buildApiPath } from '../apiConfig.js'
 
 // ---------------------------------------------------------------------------
 // RLProgressChart
@@ -22,7 +17,7 @@ export default function RLProgressChart({ running = false }) {
 
   const fetchProgress = useCallback(async () => {
     try {
-      const r = await fetch('/api/rl/progress?limit=1000', { headers: AUTH_HEADERS })
+      const r = await fetch(buildApiPath('/api/rl/progress?limit=1000'), { headers: AUTH_HEADERS })
       const d = await r.json()
       const pts = d?.data?.points
       if (Array.isArray(pts)) setPoints(pts)

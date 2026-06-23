@@ -28,6 +28,10 @@ export default function useWebSocket(url) {
       return
     }
 
+    clearTimeout(timerRef.current)
+    setStatus('connecting')
+    wsRef.current = null
+
     try {
       const ws = new WebSocket(url)
       wsRef.current = ws
@@ -59,7 +63,10 @@ export default function useWebSocket(url) {
         ws.close()   // triggers onclose → reconnect
       }
     } catch {
-      setStatus('disconnected')
+      if (!mountRef.current) return
+      setStatus('reconnecting')
+      timerRef.current = setTimeout(connect, delayRef.current)
+      delayRef.current = Math.min(delayRef.current * 2, MAX_DELAY_MS)
     }
   }, [url])
 

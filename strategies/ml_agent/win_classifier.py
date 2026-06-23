@@ -14,6 +14,8 @@ Backed by scikit-learn (GradientBoostingClassifier). Persisted with joblib.
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -69,6 +71,7 @@ class WinClassifier:
         self.model_path     = Path(model_path)
         self._model         = None
         self._feature_names: list[str] = []
+        self._reliable: bool = True  # False when trained on < 60 samples (bypass filter)
 
     # ------------------------------------------------------------------
     # Training
@@ -149,6 +152,7 @@ class WinClassifier:
 
         self._model = model
         self._feature_names = list(feature_names)
+        self._reliable = reliable
         self._save()
 
         logger.info(
@@ -167,11 +171,42 @@ class WinClassifier:
     # ------------------------------------------------------------------
 
     def predict_win_proba(self, features: dict[str, float]) -> Optional[float]:
-        """Return P(win) for one trade's feature dict, or None if no model."""
+        """Return P(win) for one trade's feature dict, or None if no model.
+
+        Returns None (filter passes through) when the incoming feature set
+        doesn't match the model's training features, so a changed feature
+        config never silently corrupts predictions.
+        """
         if self._model is None and not self.load():
             return None
-        x = np.array([[float(features.get(name, 0.0)) for name in self._feature_names]],
-                     dtype=np.float64)
+
+        if not self._reliable:
+            logger.debug(
+                "WinClassifier: model trained on <60 samples — bypassing filter "
+                "to avoid overfit-based blocking. Collect more trade data."
+            )
+            return None
+
+        if not self._feature_names:
+            return None
+
+        incoming_keys = set(features.keys())
+        trained_keys  = set(self._feature_names)
+        missing = trained_keys - incoming_keys
+        if missing:
+            logger.warning(
+                "WinClassifier: %d feature(s) missing from observation "
+                "(e.g. %s) — model was trained on a different feature set. "
+                "Skipping filter (model needs retraining).",
+                len(missing),
+                next(iter(missing)),
+            )
+            return None
+
+        x = np.array(
+            [[float(features.get(name, 0.0)) for name in self._feature_names]],
+            dtype=np.float64,
+        )
         try:
             return float(self._model.predict_proba(x)[0, 1])
         except Exception as exc:
@@ -183,13 +218,35 @@ class WinClassifier:
     # ------------------------------------------------------------------
 
     def _save(self) -> None:
+        """Atomically write the model file using a temp-file + os.replace().
+
+        Without this, a live trader thread loading the model mid-write would
+        receive a corrupt joblib file and silently predict garbage probabilities.
+        """
         if not _SKLEARN_OK or self._model is None:
             return
-        self.model_path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(
-            {"model": self._model, "feature_names": self._feature_names},
-            self.model_path,
+        dest = self.model_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=dest.parent, suffix=".joblib.tmp"
         )
+        try:
+            os.close(fd)
+            joblib.dump(
+                {
+                    "model":         self._model,
+                    "feature_names": self._feature_names,
+                    "reliable":      self._reliable,
+                },
+                tmp_path,
+            )
+            os.replace(tmp_path, dest)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def load(self) -> bool:
         """Load a previously trained model. Returns True on success."""
@@ -199,6 +256,7 @@ class WinClassifier:
             blob = joblib.load(self.model_path)
             self._model         = blob["model"]
             self._feature_names = blob["feature_names"]
+            self._reliable      = bool(blob.get("reliable", True))
             return True
         except Exception as exc:
             logger.warning("WinClassifier load failed: %s", exc)

@@ -3,12 +3,7 @@ import {
   ComposedChart, Line, Scatter, XAxis, YAxis,
   CartesianGrid, Tooltip, ResponsiveContainer, Legend,
 } from 'recharts'
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-const API_KEY = import.meta.env.VITE_API_KEY ?? ''
-const AUTH_HEADERS = API_KEY ? { 'X-API-Key': API_KEY } : {}
+import { AUTH_HEADERS, buildApiPath } from '../apiConfig.js'
 
 // ---------------------------------------------------------------------------
 // RLEnvReplay
@@ -28,7 +23,7 @@ export default function RLEnvReplay() {
     setError('')
     setMsg('')
     try {
-      const r = await fetch('/api/rl/episode?bars=600', { headers: AUTH_HEADERS })
+      const r = await fetch(buildApiPath('/api/rl/episode?bars=600'), { headers: AUTH_HEADERS })
       const d = await r.json()
       if (!r.ok || d?.success === false) {
         throw new Error(d?.error || d?.detail || `HTTP ${r.status}`)

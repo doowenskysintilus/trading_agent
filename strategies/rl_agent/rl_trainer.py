@@ -120,7 +120,7 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
 
     def __init__(
         self,
-        features: np.ndarray,           # (n_bars, n_features)
+        features: np.ndarray,           # (n_bars, n_features) — observation features only
         reward_cfg: RewardConfig,
         window_size: int   = 32,
         initial_balance: float = 100_000.0,
@@ -128,11 +128,16 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
         sl_pct: float      = 0.02,
         tp_pct: float      = 0.04,
         position_size_pct: float = 0.10,
+        prices: Optional[np.ndarray] = None,  # (n_bars,) actual close prices for PnL calc
     ) -> None:
         if not _SB3_AVAILABLE:
             raise ImportError("gymnasium and stable-baselines3 are required.")
 
         self.features       = features.astype(np.float32)
+        # prices: actual close prices used for PnL / SL / TP calculations.
+        # Falls back to features[:, 0] when not provided (legacy behaviour),
+        # but that only works correctly when the first feature column is a price.
+        self._prices        = prices.astype(np.float32) if prices is not None else None
         self.reward_cfg     = reward_cfg
         self.window_size    = window_size
         self.initial_balance = initial_balance
@@ -154,6 +159,8 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
         self._balance      = initial_balance
         self._position     = 0      # -1, 0, +1
         self._entry_price  = 0.0
+        self._sl_price     = 0.0    # live stop-loss price
+        self._tp_price     = 0.0    # live take-profit price
         self._peak_equity  = initial_balance
         self._equity       = initial_balance
         self._returns: list[float] = []
@@ -171,6 +178,8 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
         self._balance      = self.initial_balance
         self._position     = 0
         self._entry_price  = 0.0
+        self._sl_price     = 0.0
+        self._tp_price     = 0.0
         self._peak_equity  = self.initial_balance
         self._equity       = self.initial_balance
         self._returns      = []
@@ -181,8 +190,16 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
         close  = self._get_close(bar)
         prev_equity = self._equity
 
+        # ---- SL/TP auto-close (applied before agent's action) ----------
+        # If a stop-loss or take-profit was triggered at this bar's price,
+        # force-close the position so the agent learns realistic constraints.
+        sl_tp_closed = self._check_sl_tp(close)
+        if sl_tp_closed:
+            action = 1  # position already closed — treat as HOLD
+
         # ---- Execute action --------------------------------------------
         reward_components = self._execute(action, close)
+        reward_components["sl_tp_closed"] = sl_tp_closed
 
         # ---- Advance bar -----------------------------------------------
         self._bar += 1
@@ -200,6 +217,37 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
     # Execution
     # ------------------------------------------------------------------
 
+    def _check_sl_tp(self, close: float) -> bool:
+        """Auto-close the open position if SL or TP is triggered. Returns True if closed."""
+        if self._position == 0 or self._entry_price <= 0:
+            return False
+
+        # For LONG: SL fires when close <= sl_price, TP when close >= tp_price
+        # For SHORT: SL fires when close >= sl_price, TP when close <= tp_price
+        if self._position == 1:
+            if close <= self._sl_price or close >= self._tp_price:
+                exec_price = close - self.spread
+                pnl = (exec_price - self._entry_price) * self._get_size()
+                self._balance += pnl
+                self._position    = 0
+                self._entry_price = 0.0
+                self._sl_price    = 0.0
+                self._tp_price    = 0.0
+                self._equity = self._balance
+                return True
+        elif self._position == -1:
+            if close >= self._sl_price or close <= self._tp_price:
+                exec_price = close + self.spread
+                pnl = (self._entry_price - exec_price) * self._get_size()
+                self._balance += pnl
+                self._position    = 0
+                self._entry_price = 0.0
+                self._sl_price    = 0.0
+                self._tp_price    = 0.0
+                self._equity = self._balance
+                return True
+        return False
+
     def _execute(self, action: int, close: float) -> dict:
         """Open / close / hold position. Returns reward components."""
         direction = action - 1          # 0→-1(SELL), 1→0(HOLD), 2→+1(BUY)
@@ -207,19 +255,27 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
 
         pnl = 0.0
         if self._position != 0 and (action == 0 or direction != self._position):
-            # Close
+            # Close by agent signal
             exec_price = close - spread * self._position
             raw_pnl    = (exec_price - self._entry_price) * self._position
             pnl        = raw_pnl * self._get_size()
             self._balance += pnl
             self._position    = 0
             self._entry_price = 0.0
+            self._sl_price    = 0.0
+            self._tp_price    = 0.0
 
         if action != 1 and self._position == 0:
-            # Open
-            exec_price       = close + spread * direction
-            self._position   = direction
+            # Open new position — set SL/TP levels
+            exec_price        = close + spread * direction
+            self._position    = direction
             self._entry_price = exec_price
+            if direction == 1:
+                self._sl_price = exec_price * (1.0 - self.sl_pct)
+                self._tp_price = exec_price * (1.0 + self.tp_pct)
+            else:
+                self._sl_price = exec_price * (1.0 + self.sl_pct)
+                self._tp_price = exec_price * (1.0 - self.tp_pct)
 
         # Mark-to-market
         unrealized = 0.0
@@ -234,13 +290,19 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
         return {"pnl": pnl}
 
     def _get_size(self) -> float:
-        notional = self._equity * self.position_size_pct
-        close    = self._get_close(self._bar)
-        return notional / (close + 1e-10)
+        price = self._entry_price if self._position != 0 and self._entry_price > 0 \
+                else self._get_close(self._bar)
+        return (self._equity * self.position_size_pct) / (price + 1e-10)
 
     def _get_close(self, bar: int) -> float:
-        """Assumes last feature column is (or includes) a price proxy."""
-        # Use the first feature column as close price proxy
+        """Return the actual close price for bar `bar`.
+
+        Uses the dedicated `_prices` array when provided (recommended).
+        Falls back to features[:, 0] only when no price array was passed.
+        """
+        if self._prices is not None:
+            idx = min(bar, len(self._prices) - 1)
+            return float(self._prices[idx])
         return float(self.features[bar, 0])
 
     # ------------------------------------------------------------------
@@ -432,22 +494,29 @@ class RewardTrackingCallback(BaseCallback if _SB3_AVAILABLE else object):
     def _on_step(self) -> bool:
         self._ep_reward += float(self.locals["rewards"][0])
         if self.locals["dones"][0]:
-            self.episode_rewards.append(self._ep_reward)
-            recent = self.episode_rewards[-10:]
-            mean_recent = float(np.mean(recent))
-            self._write_progress(self.episode_rewards[-1], mean_recent)
+            ep_num   = len(self.episode_rewards) + 1
+            last_r   = self._ep_reward
+            self.episode_rewards.append(last_r)
+            recent       = self.episode_rewards[-10:]
+            mean_recent  = float(np.mean(recent))
+            steps        = int(getattr(self, "num_timesteps", 0))
+            self._write_progress(last_r, mean_recent)
             # Fire external progress callback every completed episode.
             if self._progress_callback is not None:
                 try:
-                    self._progress_callback(int(getattr(self, "num_timesteps", 0)))
+                    self._progress_callback(steps)
                 except Exception:
                     pass
-            if self.verbose >= 1 and len(self.episode_rewards) % 10 == 0:
-                logger.info(
-                    "Episode %d | mean_reward=%.4f | last=%.4f",
-                    len(self.episode_rewards),
-                    mean_recent,
-                    self.episode_rewards[-1],
+            # Print a live progress line every 5 episodes so the operator
+            # can see reward trending upward (or flag a problem) in real time.
+            if ep_num % 5 == 0:
+                trend = "↑" if len(self.episode_rewards) >= 2 and last_r > self.episode_rewards[-2] else "↓"
+                print(
+                    f"  [RL] Ep {ep_num:>5d} | "
+                    f"récompense={last_r:+.4f} {trend} | "
+                    f"moy(10)={mean_recent:+.4f} | "
+                    f"steps={steps:>8,}",
+                    flush=True,
                 )
             self._ep_reward = 0.0
         return True
@@ -500,9 +569,17 @@ class RLTrainer:
         """
         cfg = self.cfg
 
+        close_prices: Optional[np.ndarray] = None
+
         if custom_data is not None:
-            features = custom_data.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
-            features = features.values.astype(np.float32)
+            numeric = custom_data.select_dtypes(include=[np.number])
+            if "close" in numeric.columns:
+                close_prices = numeric["close"].values.astype(np.float32)
+            features_df = numeric.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
+            # Remove raw OHLCV to avoid price-level leakage into the agent's obs
+            drop_cols = {"open", "high", "low", "close", "volume"}
+            obs_cols = [c for c in features_df.columns if c not in drop_cols]
+            features = features_df[obs_cols].values.astype(np.float32)
             logger.info("Using custom data: %d bars × %d features", *features.shape)
         else:
             store = FeatureStore(root=cfg.feature_store_root)
@@ -526,7 +603,10 @@ class RLTrainer:
                     version=cfg.feature_version,
                     overwrite=True,
                 )
-            # Remove OHLCV raw columns — keep only engineered features
+            # Separate close price BEFORE dropping OHLCV — used for PnL/SL/TP
+            if "close" in df.columns:
+                close_prices = df["close"].values.astype(np.float32)
+            # Keep only engineered features in the agent's observation
             drop_cols = {"open", "high", "low", "close", "volume"}
             feature_cols = [c for c in df.columns if c not in drop_cols]
             features_df = df[feature_cols].replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
@@ -566,17 +646,29 @@ class RLTrainer:
         val   = features[n_train: n_train + n_val]
         test  = features[n_train + n_val:]
 
+        train_prices = val_prices = test_prices = None
+        if close_prices is not None:
+            train_prices = close_prices[:n_train]
+            val_prices   = close_prices[n_train: n_train + n_val]
+            test_prices  = close_prices[n_train + n_val:]
+
         logger.info(
-            "Split — train=%d  val=%d  test=%d",
+            "Split — train=%d  val=%d  test=%d  (prices=%s)",
             len(train), len(val), len(test),
+            "yes" if close_prices is not None else "no",
         )
-        return train, val, test
+        return train, val, test, train_prices, val_prices, test_prices
 
     # ------------------------------------------------------------------
     # Environment builders
     # ------------------------------------------------------------------
 
-    def _make_env(self, features: np.ndarray, seed: int = 0):
+    def _make_env(
+        self,
+        features: np.ndarray,
+        seed: int = 0,
+        prices: Optional[np.ndarray] = None,
+    ):
         cfg = self.cfg
 
         def _init():
@@ -589,6 +681,7 @@ class RLTrainer:
                 sl_pct           = cfg.sl_pct,
                 tp_pct           = cfg.tp_pct,
                 position_size_pct= cfg.position_size_pct,
+                prices           = prices,
             )
             return Monitor(env)
 
@@ -649,14 +742,18 @@ class RLTrainer:
         self,
         train_features: np.ndarray,
         val_features: np.ndarray,
+        train_prices: Optional[np.ndarray] = None,
+        val_prices: Optional[np.ndarray] = None,
     ) -> "RLTrainer":
         """
         Train the LSTM-PPO agent.
 
         Parameters
         ----------
-        train_features : np.ndarray  (n_train_bars, n_features)
+        train_features : np.ndarray  (n_train_bars, n_features)  — observation features only
         val_features   : np.ndarray  (n_val_bars, n_features)
+        train_prices   : np.ndarray or None  (n_train_bars,) — actual close prices for PnL calc
+        val_prices     : np.ndarray or None  (n_val_bars,)
 
         Returns self for chaining.
         """
@@ -664,8 +761,8 @@ class RLTrainer:
         Path(cfg.model_dir).mkdir(parents=True, exist_ok=True)
         Path(cfg.log_dir).mkdir(parents=True, exist_ok=True)
 
-        train_env = self._make_env(train_features)
-        val_env   = self._make_env(val_features)
+        train_env = self._make_env(train_features, prices=train_prices)
+        val_env   = self._make_env(val_features, prices=val_prices)
 
         self._train_env = train_env
         self._val_env   = val_env
@@ -712,6 +809,17 @@ class RLTrainer:
                                    progress_callback=self._progress_callback),
         ])
 
+        algo_name = "RecurrentPPO" if (cfg.use_recurrent_ppo and _SB3_CONTRIB_AVAILABLE) else "PPO"
+        print(
+            f"\n{'─'*58}\n"
+            f"  RL AGENT ({algo_name}) — ENTRAÎNEMENT\n"
+            f"{'─'*58}\n"
+            f"  Timesteps total  : {cfg.total_timesteps:>10,}\n"
+            f"  Bars train / val : {len(train_features):>7,} / {len(val_features):,}\n"
+            f"  Warm-start       : {'OUI (reprise)' if resumed else 'NON (fresh)'}\n"
+            f"{'─'*58}",
+            flush=True,
+        )
         logger.info("Training started — total_timesteps=%d (resumed=%s)",
                     cfg.total_timesteps, resumed)
         self.model.learn(
@@ -719,9 +827,31 @@ class RLTrainer:
             callback        = callbacks,
             reset_num_timesteps = not resumed,
         )
+
+        # Final summary after training
+        reward_cb = callbacks.callbacks[-1]   # RewardTrackingCallback is last
+        all_ep    = getattr(reward_cb, "episode_rewards", [])
+        if all_ep:
+            mean_last20 = float(np.mean(all_ep[-20:]))
+            mean_first5 = float(np.mean(all_ep[:5])) if len(all_ep) >= 5 else all_ep[0]
+            improvement = mean_last20 - mean_first5
+            trend_sym   = "↑ AMÉLIORATION" if improvement > 0 else "↓ DÉTÉRIORATION"
+            print(
+                f"\n{'═'*58}\n"
+                f"  RL AGENT — RÉSULTATS FINAUX\n"
+                f"{'═'*58}\n"
+                f"  Épisodes complétés   : {len(all_ep):>6,}\n"
+                f"  Récompense moy(20)   : {mean_last20:>+10.4f}\n"
+                f"  Récompense initiale  : {mean_first5:>+10.4f}\n"
+                f"  Progression          : {improvement:>+10.4f}  {trend_sym}\n"
+                f"  Modèle sauvegardé → {cfg.model_dir}/{cfg.model_name}.zip\n"
+                f"{'═'*58}\n",
+                flush=True,
+            )
+        else:
+            print(f"\n[RL] Entraînement terminé ({cfg.total_timesteps:,} steps).\n", flush=True)
+
         logger.info("Training complete.")
-        # Persist the up-to-date model so the next run can resume from it
-        # and live inference (RLAlpha) picks up the latest weights.
         self.save()
         return self
 
@@ -776,12 +906,26 @@ class RLTrainer:
             all_rewards.append(ep_reward)
             all_lengths.append(ep_len)
 
+        mean_r = float(np.mean(all_rewards))
+        std_r  = float(np.std(all_rewards))
+        mean_l = float(np.mean(all_lengths))
         results = {
-            "mean_reward":     float(np.mean(all_rewards)),
-            "std_reward":      float(np.std(all_rewards)),
-            "mean_episode_len": float(np.mean(all_lengths)),
-            "n_episodes":      n_episodes,
+            "mean_reward":      mean_r,
+            "std_reward":       std_r,
+            "mean_episode_len": mean_l,
+            "n_episodes":       n_episodes,
         }
+        verdict = "✓ BON" if mean_r > 0 else "✗ NÉGATIF — continuer l'entraînement"
+        print(
+            f"\n{'─'*58}\n"
+            f"  RL AGENT — ÉVALUATION ({n_episodes} épisodes test)\n"
+            f"{'─'*58}\n"
+            f"  Récompense moyenne   : {mean_r:>+10.4f}  {verdict}\n"
+            f"  Écart-type           : {std_r:>10.4f}\n"
+            f"  Durée moy. épisode   : {mean_l:>10.0f} bars\n"
+            f"{'─'*58}\n",
+            flush=True,
+        )
         logger.info("Evaluation — %s", results)
         return results
 

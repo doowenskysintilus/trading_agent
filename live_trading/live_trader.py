@@ -250,17 +250,19 @@ class LiveTraderConfig:
     success_reset_count:   int   = 10    # consecutive successes to reset retries
 
     # ---- Emergency stop -------------------------------------------------
-    stop_flag_path: str = "data/storage/EMERGENCY_STOP"
+    # Uses an absolute path derived from the project root so the flag is
+    # always found regardless of the current working directory at launch.
+    stop_flag_path: str = ""   # resolved to absolute in __post_init__
 
     # ---- I/O -----------------------------------------------------------
-    log_dir: str = "data/storage/logs/live"
+    log_dir: str = ""          # resolved to absolute in __post_init__
 
     # ---- Training-data collection --------------------------------------
     # When True, every executed trade's entry observation + realized outcome
     # is written to dataset_dir (one record per trade — no per-cycle bloat),
     # for offline RL / ML retraining.
     collect_experiences: bool = True
-    dataset_dir: str = "data/storage/datasets"
+    dataset_dir: str = ""      # resolved to absolute in __post_init__
 
     # ---- ML win/loss confidence filter ---------------------------------
     # When enabled, the trained WinClassifier predicts P(win) from the entry
@@ -268,7 +270,34 @@ class LiveTraderConfig:
     # trained yet (or sklearn missing), the filter passes everything through.
     ml_filter_enabled: bool = True
     ml_min_win_proba:  float = 0.50
-    ml_model_path:     str   = "data/storage/models/win_classifier.joblib"
+    ml_model_path:     str   = ""   # resolved to absolute in __post_init__
+
+    # ---- FTMO Prop Firm Compliance -------------------------------------
+    # Set ftmo_enabled=True and ftmo_initial_balance to your challenge
+    # starting balance to activate FTMO hard limits in the risk engine.
+    ftmo_enabled:          bool  = False
+    ftmo_initial_balance:  float = 0.0
+
+    def __post_init__(self) -> None:
+        """Resolve relative paths to absolute using the project root.
+
+        Prevents bugs where the flag file / log dir is written in a different
+        location depending on which directory the process was launched from.
+        """
+        try:
+            from config.settings import PROJECT_ROOT
+            _root = PROJECT_ROOT
+        except Exception:
+            _root = Path(__file__).resolve().parent.parent
+
+        def _abs(p: str, default: str) -> str:
+            val = p or default
+            return str((_root / val).resolve()) if not Path(val).is_absolute() else val
+
+        self.stop_flag_path = _abs(self.stop_flag_path, "data/storage/EMERGENCY_STOP")
+        self.log_dir        = _abs(self.log_dir,        "data/storage/logs/live")
+        self.dataset_dir    = _abs(self.dataset_dir,    "data/storage/datasets")
+        self.ml_model_path  = _abs(self.ml_model_path,  "data/storage/models/win_classifier.joblib")
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +401,13 @@ class LiveTrader:
         if self.cfg.htf_enabled and not self.cfg.htf_timeframe:
             self.cfg.htf_timeframe = _derive_htf(self.cfg.timeframe)
 
+        # Sync top-level FTMO settings into risk_config so the risk engine
+        # picks them up without requiring the user to configure both places.
+        if self.cfg.ftmo_enabled:
+            self.cfg.risk_config.ftmo_enabled = True
+            if self.cfg.ftmo_initial_balance > 0:
+                self.cfg.risk_config.ftmo_initial_balance = self.cfg.ftmo_initial_balance
+
         # ---- Sub-engines ------------------------------------------------
         self._feature_eng  = FeatureEngineer(self.cfg.feature_config)
         self._aggregator   = SignalAggregator()
@@ -391,11 +427,13 @@ class LiveTrader:
 
         # ---- State -------------------------------------------------------
         self._portfolio_state = PortfolioState(
-            equity             = self.cfg.initial_balance,
-            balance            = self.cfg.initial_balance,
-            peak_equity        = self.cfg.initial_balance,
-            daily_start_equity = self.cfg.initial_balance,
-            open_positions     = [],
+            equity                = self.cfg.initial_balance,
+            balance               = self.cfg.initial_balance,
+            peak_equity           = self.cfg.initial_balance,
+            daily_start_equity    = self.cfg.initial_balance,
+            open_positions        = [],
+            ftmo_initial_balance  = self.cfg.risk_config.ftmo_initial_balance
+                                    if self.cfg.ftmo_enabled else 0.0,
         )
         # Daily-loss / drawdown references are re-anchored to the REAL account
         # equity on the first live read (see _sync_account_state). Until then
@@ -409,6 +447,10 @@ class LiveTrader:
         self._stop_event       = threading.Event()
         self._background_thread: Optional[threading.Thread] = None
         self._auto_bars_cache: dict[tuple[str, str], int] = {}
+
+        # Lock protecting shared mutable state accessed by both the trading
+        # thread and the REST API thread concurrently.
+        self._state_lock = threading.Lock()
 
         # ---- Emergency stop ---------------------------------------------
         self._emergency = EmergencyStopManager(self.cfg.stop_flag_path)
@@ -1026,9 +1068,12 @@ class LiveTrader:
         symbol: str,
         decision: AggregatedDecision,
     ) -> TradeOrder:
+        # _get_last_price raises ValueError if price is unavailable or zero.
+        # Let the exception propagate so _run_cycle marks the cycle ERROR
+        # instead of placing an order at price=0.
+        entry_price = self._get_last_price(symbol)
         equity      = self._portfolio_state.equity
         atr_proxy   = self._get_atr_proxy(symbol)
-        entry_price = self._get_last_price(symbol)
         direction   = 1 if decision.signal == SignalType.BUY else -1
 
         # Initial volatility-based size: risk a fixed fraction of equity per
@@ -1057,11 +1102,23 @@ class LiveTrader:
         )
 
     def _get_last_price(self, symbol: str) -> float:
-        """Latest close price from cached OHLCV data (fallback 0.0)."""
+        """Latest close price from cached OHLCV data.
+
+        Raises ValueError when no data is available or the price is
+        non-positive, so callers cannot accidentally place orders at
+        price 0 (which would produce catastrophic SL/TP values).
+        """
         data = self._data_cache.get(symbol)
         if data is None or len(data) == 0:
-            return 0.0
-        return float(data["close"].values[-1])
+            raise ValueError(
+                f"No OHLCV cache for {symbol} — cannot compute entry price."
+            )
+        price = float(data["close"].values[-1])
+        if price <= 0:
+            raise ValueError(
+                f"Invalid close price {price} for {symbol} — aborting order."
+            )
+        return price
 
     def _get_atr_proxy(self, symbol: str) -> float:
         """Estimate ATR from cached data (last 14 bars)."""
@@ -1120,7 +1177,8 @@ class LiveTrader:
                         v["strategy"] for v in (decision.votes or [])
                         if v.get("counted") and v.get("signal") == decision.signal.value
                     ] or [m.name for m in self._strategies]
-                    self._open_trades[result.ticket] = {
+                    with self._state_lock:
+                        self._open_trades[result.ticket] = {
                         "symbol":      approved_order.symbol,
                         "strategies":  contributors,
                         "direction":   "BUY" if approved_order.direction == +1 else "SELL",
@@ -1184,6 +1242,9 @@ class LiveTrader:
                 self._portfolio_state.daily_start_equity = eq
                 if not self._account_anchored:
                     self._portfolio_state.peak_equity = eq
+                # Reset FTMO daily profit tracker at midnight
+                if self._account_anchored and self._anchor_day != today:
+                    self._portfolio_state.ftmo_today_profit = 0.0
                 self._account_anchored = True
                 self._anchor_day = today
                 logger.info(
@@ -1239,9 +1300,11 @@ class LiveTrader:
     def get_live_positions(self) -> list[dict]:
         """Return open MT5 positions enriched with strategy attribution."""
         positions = self._exec_engine.get_open_positions()
+        with self._state_lock:
+            open_trades_snapshot = dict(self._open_trades)
         result: list[dict] = []
         for p in positions:
-            info = self._open_trades.get(p.ticket, {})
+            info = open_trades_snapshot.get(p.ticket, {})
             strategies = info.get("strategies")
             strategy_label = (
                 ", ".join(strategies)
@@ -1277,8 +1340,10 @@ class LiveTrader:
         Runs once per cycle sweep. Compares tracked entry tickets against the
         positions still open in MT5; any missing ticket has been closed.
         """
-        if not self._open_trades:
-            return
+        with self._state_lock:
+            if not self._open_trades:
+                return
+            tracked = dict(self._open_trades)
 
         try:
             open_now = {p.ticket for p in self._exec_engine.get_open_positions()}
@@ -1286,9 +1351,12 @@ class LiveTrader:
             logger.debug("Reconciliation skipped — cannot list positions: %s", exc)
             return
 
-        closed_tickets = [t for t in list(self._open_trades) if t not in open_now]
+        closed_tickets = [t for t in tracked if t not in open_now]
         for ticket in closed_tickets:
-            info = self._open_trades.pop(ticket)
+            with self._state_lock:
+                info = self._open_trades.pop(ticket, None)
+            if info is None:
+                continue
 
             res = None
             try:
@@ -1304,6 +1372,16 @@ class LiveTrader:
             exit_price = float(res.get("exit_price", 0.0))
             ts         = datetime.now(timezone.utc)
             duration_s = int((ts - info["entry_ts"]).total_seconds())
+
+            # Update kill-switch counter and FTMO profit trackers.
+            with self._state_lock:
+                if pnl < 0:
+                    self._portfolio_state.consecutive_losses += 1
+                elif pnl > 0:
+                    self._portfolio_state.consecutive_losses = 0
+                if self.cfg.risk_config.ftmo_enabled:
+                    self._portfolio_state.ftmo_today_profit  += pnl
+                    self._portfolio_state.ftmo_total_profit  += pnl
 
             # 1) Feed the learning components, per contributing strategy.
             for strat in info["strategies"]:
@@ -1432,17 +1510,23 @@ class LiveTrader:
 
     def get_status(self) -> dict:
         """Return a snapshot of the current trader state."""
+        with self._state_lock:
+            equity       = self._portfolio_state.equity
+            balance      = self._portfolio_state.balance
+            n_positions  = len(self._portfolio_state.open_positions)
+            consec_loss  = self._portfolio_state.consecutive_losses
         return {
-            "running":          self._running,
-            "cycle_id":         self._cycle_id,
-            "emergency_active": self._emergency.is_active,
-            "retry_count":      self._retry_count,
-            "consecutive_ok":   self._consecutive_ok,
-            "strategies":       [m.name for m in self._strategies],
-            "symbols":          self.cfg.symbols,
-            "equity":           self._portfolio_state.equity,
-            "balance":          self._portfolio_state.balance,
-            "open_positions":   len(self._portfolio_state.open_positions),
+            "running":              self._running,
+            "cycle_id":             self._cycle_id,
+            "emergency_active":     self._emergency.is_active,
+            "retry_count":          self._retry_count,
+            "consecutive_ok":       self._consecutive_ok,
+            "consecutive_losses":   consec_loss,
+            "strategies":           [m.name for m in self._strategies],
+            "symbols":              self.cfg.symbols,
+            "equity":               equity,
+            "balance":              balance,
+            "open_positions":       n_positions,
         }
 
     def get_allocation_summary(self) -> dict:

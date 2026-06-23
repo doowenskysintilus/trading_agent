@@ -151,7 +151,7 @@ class AppState:
 
     def is_emergency_active(self) -> bool:
         if self.trader and hasattr(self.trader, "emergency"):
-            return self.trader.emergency.is_set()
+            return self.trader.emergency.is_active
         return False
 
 

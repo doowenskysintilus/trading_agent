@@ -1,14 +1,5 @@
 import { useState, useCallback, useEffect } from 'react'
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-const API_KEY = import.meta.env.VITE_API_KEY ?? ''
-
-const AUTH_HEADERS = {
-  'Content-Type': 'application/json',
-  ...(API_KEY ? { 'X-API-Key': API_KEY } : {}),
-}
+import { AUTH_HEADERS, buildApiPath } from '../apiConfig.js'
 
 // Common FX / metal pairs offered as quick presets. The user can also type
 // any symbol manually (must match the broker's exact symbol name in MT5).
@@ -61,7 +52,7 @@ export default function TradingControls({ running, emergency }) {
   // Pre-fill the panel with the defaults configured in .env (server-side).
   useEffect(() => {
     let cancelled = false
-    fetch('/api/trading/config', { headers: AUTH_HEADERS })
+    fetch(buildApiPath('/api/trading/config'), { headers: AUTH_HEADERS })
       .then((r) => (r.ok ? r.json() : null))
       .then((res) => {
         const cfg = res?.data
@@ -100,7 +91,7 @@ export default function TradingControls({ running, emergency }) {
     setBusy(true)
     setError('')
     try {
-      const res = await fetch(`/api${path}`, {
+      const res = await fetch(buildApiPath(`/api${path}`), {
         method:  'POST',
         headers: AUTH_HEADERS,
         body:    body ? JSON.stringify(body) : undefined,

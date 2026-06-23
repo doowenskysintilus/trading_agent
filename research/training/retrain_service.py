@@ -154,10 +154,20 @@ class RetrainService:
         runs = 0
         try:
             if train_ml:
+                print(
+                    f"\n{'▶'*3} ML RETRAIN — WinClassifier (données : {self.dataset_dir}) {'▶'*3}",
+                    flush=True,
+                )
                 ml_result = self._retrain_ml()
             if train_rl:
                 while not self._stop_event.is_set():
                     runs += 1
+                    print(
+                        f"\n{'▶'*3} RL RETRAIN — Run #{runs} | "
+                        f"{rl_timesteps:,} steps | "
+                        f"{'continu' if rl_continuous else 'one-shot'} {'▶'*3}",
+                        flush=True,
+                    )
                     # Signal "en cours" AVANT le run (peut durer plusieurs minutes)
                     with self._lock:
                         self._status.run_count = runs
@@ -223,9 +233,70 @@ class RetrainService:
 
     def _retrain_ml(self) -> dict:
         X, y, names = build_supervised_dataset(self.dataset_dir)
-        clf = WinClassifier(model_path=f"{self.model_dir}/win_classifier.joblib")
+        clf    = WinClassifier(model_path=f"{self.model_dir}/win_classifier.joblib")
         report = clf.train(X, y, names)
-        return report.as_dict()
+        result = report.as_dict()
+        self._print_ml_report(result)
+        return result
+
+    @staticmethod
+    def _print_ml_report(r: dict) -> None:
+        """Print a formatted ML training report to the terminal."""
+        line = "─" * 58
+        if not r.get("trained"):
+            print(
+                f"\n{line}\n"
+                f"  ML WIN CLASSIFIER — NON ENTRAÎNÉ\n"
+                f"{line}\n"
+                f"  Raison : {r.get('message', '?')}\n"
+                f"{line}\n",
+                flush=True,
+            )
+            return
+
+        n        = r.get("n_samples", 0)
+        n_wins   = r.get("n_wins",    0)
+        n_losses = r.get("n_losses",  0)
+        acc      = r.get("accuracy",  0.0) * 100
+        auc      = r.get("auc",       0.0)
+        reliable = r.get("reliable",  True)
+        warning  = r.get("warning",   "")
+
+        if acc >= 70:
+            acc_sym = "✓ BON"
+        elif acc >= 60:
+            acc_sym = "~ ACCEPTABLE"
+        else:
+            acc_sym = "✗ FAIBLE"
+
+        if auc >= 0.75:
+            auc_sym = "✓ BON"
+        elif auc >= 0.60:
+            auc_sym = "~ ACCEPTABLE"
+        else:
+            auc_sym = "✗ FAIBLE"
+
+        win_rate = (n_wins / n * 100) if n > 0 else 0.0
+        fiab = "✓ FIABLE" if reliable else "⚠ DONNÉES INSUFFISANTES"
+
+        print(
+            f"\n{'═'*58}\n"
+            f"  ML WIN CLASSIFIER — RÉSULTATS D'ENTRAÎNEMENT\n"
+            f"{'═'*58}\n"
+            f"  Trades analysés     : {n:>6,}\n"
+            f"  Wins / Losses       : {n_wins:>4,} W  /  {n_losses:>4,} L  "
+            f"(win rate réel : {win_rate:.1f}%)\n"
+            f"  Features utilisées  : {r.get('n_features', 0):>6,}\n"
+            f"{'─'*58}\n"
+            f"  Accuracy            : {acc:>6.1f}%   {acc_sym}\n"
+            f"  AUC-ROC             : {auc:>6.3f}    {auc_sym}\n"
+            f"  Fiabilité           : {fiab}\n",
+            end="",
+            flush=True,
+        )
+        if warning:
+            print(f"  ⚠  {warning}", flush=True)
+        print(f"{'═'*58}\n", flush=True)
 
     # ------------------------------------------------------------------
     # RL — RecurrentPPO via the existing RLTrainer
@@ -262,28 +333,42 @@ class RetrainService:
 
         try:
             trainer = RLTrainer(cfg)
-            train_f, val_f, _ = trainer.prepare_data(custom_data=feature_df)
+            train_f, val_f, test_f, train_p, val_p, test_p = trainer.prepare_data(custom_data=feature_df)
             if len(train_f) <= cfg.window_size + 2 or len(val_f) <= cfg.window_size + 2:
-                return {
-                    "trained": False,
-                    "message": ("Not enough market-data history to retrain the RL "
-                                "agent. Provide more bars / populate the FeatureStore."),
-                }
+                msg = ("Not enough market-data history to retrain the RL "
+                       "agent. Provide more bars / populate the FeatureStore.")
+                print(f"\n[RL] ✗ {msg}\n", flush=True)
+                return {"trained": False, "message": msg}
             if progress_callback is not None:
                 trainer.set_progress_callback(progress_callback)
-            trainer.train(train_f, val_f)
-            return {
-                "trained": True,
-                "timesteps": timesteps,
+            trainer.train(train_f, val_f, train_prices=train_p, val_prices=val_p)
+
+            # Évaluation sur le jeu de test (si assez de données)
+            eval_results: dict = {}
+            if len(test_f) > cfg.window_size + 2:
+                try:
+                    eval_results = trainer.evaluate(test_f, n_episodes=5)
+                except Exception as exc:
+                    logger.warning("RL evaluation failed: %s", exc)
+
+            result = {
+                "trained":    True,
+                "timesteps":  timesteps,
                 "train_bars": int(len(train_f)),
-                "val_bars": int(len(val_f)),
-                "message": "RL agent retrained (RecurrentPPO).",
+                "val_bars":   int(len(val_f)),
+                "test_bars":  int(len(test_f)),
+                "message":    "RL agent retrained (RecurrentPPO).",
+                **({
+                    "eval_mean_reward": round(eval_results["mean_reward"], 4),
+                    "eval_std_reward":  round(eval_results["std_reward"],  4),
+                } if eval_results else {}),
             }
+            return result
         except FileNotFoundError:
-            return {
-                "trained": False,
-                "message": ("No FeatureStore data found and no feature provider "
-                            "supplied — cannot retrain RL agent yet."),
-            }
+            msg = ("No FeatureStore data found and no feature provider "
+                   "supplied — cannot retrain RL agent yet.")
+            print(f"\n[RL] ✗ {msg}\n", flush=True)
+            return {"trained": False, "message": msg}
         except Exception as exc:
+            print(f"\n[RL] ✗ Erreur : {type(exc).__name__}: {exc}\n", flush=True)
             return {"trained": False, "message": f"{type(exc).__name__}: {exc}"}

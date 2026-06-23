@@ -17,7 +17,7 @@ from threading import Lock
 from typing import Optional
 
 try:
-    from fastapi import Depends, HTTPException, Security, status
+    from fastapi import Depends, HTTPException, Request, Security, status
     from fastapi.security import APIKeyHeader, APIKeyQuery, HTTPAuthorizationCredentials, HTTPBearer
     _FASTAPI_OK = True
 except ImportError:
@@ -101,15 +101,38 @@ if _FASTAPI_OK:
             )
         return provided
 
-    async def check_rate_limit(
-        request=None,
-        _: str = Depends(require_api_key),
-    ) -> None:
+    async def require_api_key_with_rate_limit(
+        request: "Request",
+        bearer: Optional[HTTPAuthorizationCredentials] = Security(_bearer_scheme),
+        header: Optional[str]                          = Security(_header_scheme),
+        query:  Optional[str]                          = Security(_query_scheme),
+    ) -> str:
         """
-        Combined auth + rate-limit dependency.
-        Use this as the default dependency on all protected endpoints.
+        Combined auth + rate-limit dependency used on all protected endpoints.
+
+        Previously the rate limiter lived in a separate dependency that was
+        never actually wired to any endpoint — so it never ran. Now both
+        checks happen in a single dependency that IS wired via Auth.
         """
-        if _RATE_LIMIT_ON and request is not None:
+        # 1) API-key validation
+        if _API_KEY:
+            provided = None
+            if bearer and bearer.credentials:
+                provided = bearer.credentials
+            elif header:
+                provided = header
+            elif query:
+                provided = query
+
+            if not provided or provided != _API_KEY:
+                raise HTTPException(
+                    status_code = status.HTTP_401_UNAUTHORIZED,
+                    detail      = "Invalid or missing API key.",
+                    headers     = {"WWW-Authenticate": "Bearer"},
+                )
+
+        # 2) Rate limiting (per IP, only when auth is enabled)
+        if _RATE_LIMIT_ON and _API_KEY:
             ip = getattr(getattr(request, "client", None), "host", "unknown")
             if not _rate_limiter.check(ip):
                 raise HTTPException(
@@ -117,8 +140,10 @@ if _FASTAPI_OK:
                     detail      = "Rate limit exceeded.",
                 )
 
-    # Convenience alias
-    Auth = Depends(require_api_key)
+        return "ok"
+
+    # Convenience alias used in all endpoint `dependencies=[Auth]`
+    Auth = Depends(require_api_key_with_rate_limit)
 
 else:
     Auth = None  # type: ignore

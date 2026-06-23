@@ -70,7 +70,10 @@ class RejectReason(str, Enum):
     CORRELATION_CONCENTRATION  = "correlation_concentration"
     LEVERAGE_EXCEEDED          = "leverage_exceeded"
     INSUFFICIENT_BALANCE       = "insufficient_balance"
-    EVENT_BLACKOUT             = "event_blackout"  # Economic event blackout
+    EVENT_BLACKOUT             = "event_blackout"
+    FTMO_DAILY_LOSS            = "ftmo_daily_loss_limit"
+    FTMO_MAX_DRAWDOWN          = "ftmo_max_drawdown"
+    FTMO_CONSISTENCY           = "ftmo_consistency_rule"
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +116,18 @@ class RiskConfig:
     event_blackout_enabled: bool    = True   # enable blackout around major events
     event_blackout_hours: float     = 0.5    # don't trade within 30 min of event
     event_vol_multiplier: float     = 1.5    # scale ATR by this during events
+
+    # --- FTMO Prop Firm Compliance ------------------------------------------
+    # Enable when trading an FTMO Challenge / Verification / Funded account.
+    # Limits reference the immutable initial_balance of the challenge, not the
+    # daily peak, so they are stricter than the generic kill-switch above.
+    ftmo_enabled: bool              = False
+    ftmo_initial_balance: float     = 100_000.0   # challenge starting balance
+    # Soft stops: 0.5 % / 1 % of headroom before FTMO's hard 5 % / 10 % limits
+    ftmo_daily_loss_pct: float      = 0.045        # block at 4.5 % (hard limit 5 %)
+    ftmo_max_drawdown_pct: float    = 0.09         # block at 9 %  (hard limit 10 %)
+    ftmo_consistency_enabled: bool  = True
+    ftmo_consistency_max_day_pct: float = 0.25     # one day ≤ 25 % of total profit
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +183,11 @@ class PortfolioState:
     open_positions: list[OpenPosition] = field(default_factory=list)
     consecutive_losses: int = 0
     returns_matrix: Optional[pd.DataFrame] = None  # columns = symbols, rows = bars
+
+    # FTMO tracking — updated by LiveTrader on every closed trade
+    ftmo_initial_balance: float = 0.0   # locked at challenge start
+    ftmo_total_profit: float    = 0.0   # cumulative PnL since challenge start
+    ftmo_today_profit: float    = 0.0   # today's PnL (reset at midnight)
 
     @property
     def drawdown(self) -> float:
@@ -339,6 +359,19 @@ class RiskEngine:
         # Re-arm kill switch if conditions cleared
         self._kill_switch_active = False
 
+        # ---- Layer 1b: FTMO Compliance (prop-firm hard limits) -----------
+        if self.config.ftmo_enabled:
+            ftmo_check = self._check_ftmo_rules(portfolio_state)
+            checks.append(ftmo_check)
+            if not ftmo_check.passed:
+                logger.warning("FTMO COMPLIANCE BLOCK: %s", ftmo_check.message)
+                return RiskDecision(
+                    verdict=RiskVerdict.BLOCK,
+                    blocked_trades=list(trades),
+                    checks=checks,
+                    metadata={"ftmo_block": True},
+                )
+
         # ---- Layer 2: Portfolio drawdown --------------------------------
         dd_check = self._check_drawdown(portfolio_state)
         checks.append(dd_check)
@@ -351,6 +384,13 @@ class RiskEngine:
             )
 
         # ---- Per-trade evaluation (layers 3-6) --------------------------
+        # Keep a map of original sizes keyed by (symbol, strategy) so the
+        # overall-verdict comparison stays correct even when some trades get
+        # BLOCK'd (approved is a subset of trades, not aligned by index).
+        original_sizes: dict[tuple, float] = {
+            (t.symbol, t.strategy): t.size for t in trades
+        }
+
         for trade in trades:
             trade_checks: list[RiskCheckResult] = []
             current_size  = trade.size
@@ -420,7 +460,10 @@ class RiskEngine:
         # ---- Overall verdict -------------------------------------------
         if blocked and not approved:
             overall = RiskVerdict.BLOCK
-        elif any(t.size < orig.size for t, orig in zip(approved, trades)):
+        elif any(
+            t.size < original_sizes.get((t.symbol, t.strategy), t.size)
+            for t in approved
+        ):
             overall = RiskVerdict.REDUCE
         else:
             overall = RiskVerdict.APPROVE
@@ -495,6 +538,89 @@ class RiskEngine:
             name="event_blackout",
             passed=True,
             verdict=RiskVerdict.APPROVE,
+        )
+
+    # ------------------------------------------------------------------
+    # Layer 1b — FTMO Compliance
+    # ------------------------------------------------------------------
+
+    def _check_ftmo_rules(self, ps: PortfolioState) -> RiskCheckResult:
+        """
+        Enforce FTMO prop-firm hard limits.
+
+        Uses the immutable initial_balance as the fixed reference (not the
+        daily HWM), matching FTMO's actual rule definition:
+          - Daily loss ≤ 5 % of initial balance (soft stop: 4.5 %)
+          - Total drawdown ≤ 10 % of initial balance (soft stop: 9 %)
+          - No single day > 25 % of cumulative profit (consistency rule)
+        """
+        cfg = self.config
+        initial = ps.ftmo_initial_balance if ps.ftmo_initial_balance > 0 else cfg.ftmo_initial_balance
+
+        # 1. Daily loss limit (loss today vs initial balance)
+        today_loss = max(0.0, ps.daily_start_equity - ps.equity)
+        today_loss_pct = today_loss / (initial + 1e-10)
+        if today_loss_pct >= cfg.ftmo_daily_loss_pct:
+            return RiskCheckResult(
+                name="ftmo_daily_loss",
+                passed=False,
+                verdict=RiskVerdict.BLOCK,
+                reason=RejectReason.FTMO_DAILY_LOSS,
+                message=(
+                    f"FTMO daily loss {today_loss_pct*100:.2f}% ≥ "
+                    f"soft limit {cfg.ftmo_daily_loss_pct*100:.1f}% "
+                    f"(initial={initial:.0f}, lost={today_loss:.2f})"
+                ),
+            )
+
+        # 2. Max overall drawdown (equity vs initial balance)
+        total_drawdown = max(0.0, initial - ps.equity) / (initial + 1e-10)
+        if total_drawdown >= cfg.ftmo_max_drawdown_pct:
+            return RiskCheckResult(
+                name="ftmo_max_drawdown",
+                passed=False,
+                verdict=RiskVerdict.BLOCK,
+                reason=RejectReason.FTMO_MAX_DRAWDOWN,
+                message=(
+                    f"FTMO drawdown {total_drawdown*100:.2f}% ≥ "
+                    f"soft limit {cfg.ftmo_max_drawdown_pct*100:.1f}% "
+                    f"(equity={ps.equity:.2f}, initial={initial:.0f})"
+                ),
+            )
+
+        # 3. Consistency rule: today's profit ≤ X % of total profit
+        if (
+            cfg.ftmo_consistency_enabled
+            and ps.ftmo_total_profit > 0
+            and ps.ftmo_today_profit > 0
+        ):
+            today_share = ps.ftmo_today_profit / (ps.ftmo_total_profit + 1e-10)
+            if today_share >= cfg.ftmo_consistency_max_day_pct:
+                return RiskCheckResult(
+                    name="ftmo_consistency",
+                    passed=False,
+                    verdict=RiskVerdict.BLOCK,
+                    reason=RejectReason.FTMO_CONSISTENCY,
+                    message=(
+                        f"FTMO consistency: today +{ps.ftmo_today_profit:.2f} "
+                        f"= {today_share*100:.1f}% of total +{ps.ftmo_total_profit:.2f} "
+                        f"≥ limit {cfg.ftmo_consistency_max_day_pct*100:.0f}% — "
+                        f"stop trading today"
+                    ),
+                )
+
+        headroom_daily   = (cfg.ftmo_daily_loss_pct   - today_loss_pct)   * 100
+        headroom_drawdown = (cfg.ftmo_max_drawdown_pct - total_drawdown)   * 100
+        return RiskCheckResult(
+            name="ftmo_compliance",
+            passed=True,
+            verdict=RiskVerdict.APPROVE,
+            message=(
+                f"FTMO OK | daily_loss={today_loss_pct*100:.2f}% "
+                f"(headroom {headroom_daily:.2f}%) | "
+                f"drawdown={total_drawdown*100:.2f}% "
+                f"(headroom {headroom_drawdown:.2f}%)"
+            ),
         )
 
     # ------------------------------------------------------------------    # Layer 1 — Kill switch
@@ -840,7 +966,7 @@ class RiskEngine:
     def get_risk_summary(self, ps: PortfolioState) -> dict:
         """Quick snapshot of current risk metrics without evaluating trades."""
         cfg = self.config
-        return {
+        summary: dict = {
             "equity":             round(ps.equity, 2),
             "drawdown_pct":       round(ps.drawdown * 100, 2),
             "daily_loss_pct":     round(ps.daily_loss_pct * 100, 2),
@@ -859,3 +985,23 @@ class RiskEngine:
                 ),
             },
         }
+
+        if cfg.ftmo_enabled:
+            initial = ps.ftmo_initial_balance if ps.ftmo_initial_balance > 0 else cfg.ftmo_initial_balance
+            today_loss     = max(0.0, ps.daily_start_equity - ps.equity)
+            today_loss_pct = today_loss / (initial + 1e-10)
+            total_dd_pct   = max(0.0, initial - ps.equity) / (initial + 1e-10)
+            summary["ftmo"] = {
+                "initial_balance":       round(initial, 2),
+                "current_equity":        round(ps.equity, 2),
+                "today_loss_pct":        round(today_loss_pct * 100, 2),
+                "total_drawdown_pct":    round(total_dd_pct * 100, 2),
+                "today_profit":          round(ps.ftmo_today_profit, 2),
+                "total_profit":          round(ps.ftmo_total_profit, 2),
+                "headroom_daily_pct":    round((cfg.ftmo_daily_loss_pct   - today_loss_pct) * 100, 2),
+                "headroom_drawdown_pct": round((cfg.ftmo_max_drawdown_pct - total_dd_pct)   * 100, 2),
+                "daily_limit_pct":       round(cfg.ftmo_daily_loss_pct   * 100, 1),
+                "drawdown_limit_pct":    round(cfg.ftmo_max_drawdown_pct * 100, 1),
+            }
+
+        return summary

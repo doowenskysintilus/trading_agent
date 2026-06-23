@@ -8,18 +8,7 @@ import EconomicCalendar   from './components/EconomicCalendar.jsx'
 import TradingControls    from './components/TradingControls.jsx'
 import RetrainControls    from './components/RetrainControls.jsx'
 import useWebSocket       from './hooks/useWebSocket.js'
-
-// ---------------------------------------------------------------------------
-// Config — override with VITE_API_KEY env var if needed
-// ---------------------------------------------------------------------------
-const API_KEY = import.meta.env.VITE_API_KEY ?? ''
-const AUTH_HEADERS = API_KEY ? { 'X-API-Key': API_KEY } : {}
-const WS_URL  = (() => {
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const host  = window.location.host
-  const qs    = API_KEY ? `?api_key=${encodeURIComponent(API_KEY)}` : ''
-  return `${proto}//${host}/ws${qs}`
-})()
+import { AUTH_HEADERS, WS_URL, buildApiPath } from './apiConfig.js'
 
 // ---------------------------------------------------------------------------
 // App
@@ -167,7 +156,7 @@ export default function App() {
 
     const refreshOpenPositions = async () => {
       try {
-        const r = await fetch('/api/trades/open', { headers: AUTH_HEADERS })
+        const r = await fetch(buildApiPath('/api/trades/open'), { headers: AUTH_HEADERS })
         const d = await r.json()
         if (!active) return
         if (r.ok && d?.success !== false) {

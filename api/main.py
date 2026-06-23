@@ -58,6 +58,7 @@ from api.schemas      import (
     BacktestRequest, BacktestJobResponse, BacktestResultResponse,
     BacktestStrategyMetrics, BacktestJobStatus,
     ManualTradeRequest, ClosePositionRequest, TradeExecutionResponse,
+    TradeDirection,
     RiskStatusResponse, RiskConfigUpdate, DrawdownPeriod,
     RetrainRequest,
     EconomicEventResponse, CalendarEventsResponse,
@@ -215,10 +216,15 @@ def create_app(
         redoc_url   = "/redoc",
     )
 
+    # CORS: allow_credentials=True is incompatible with allow_origins=["*"]
+    # (browsers reject it). If no explicit origins are configured we fall back
+    # to a non-credentialed wildcard so the dashboard still works.
+    _origins = cors_origins or []
+    _credentials = bool(_origins)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins     = cors_origins or ["*"],
-        allow_credentials = True,
+        allow_origins     = _origins if _origins else ["*"],
+        allow_credentials = _credentials,
         allow_methods     = ["*"],
         allow_headers     = ["*", "X-API-Key"],
     )

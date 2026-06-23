@@ -1,0 +1,33 @@
+{
+  "EURUSD/H1/v1": {
+    "symbol": "EURUSD",
+    "timeframe": "H1",
+    "version": "v1",
+    "n_rows": 1260,
+    "n_cols": 28,
+    "checksum": "c7ef6269052bf6e2a75d4f41ec4b525f",
+    "config": {
+      "returns_periods": [
+        1,
+        5,
+        10
+      ],
+      "volatility_window": 20,
+      "parkinson": true,
+      "ema_fast": 12,
+      "ema_slow": 26,
+      "rsi_period": 14,
+      "macd_fast": 12,
+      "macd_slow": 26,
+      "macd_signal": 9,
+      "atr_period": 14,
+      "bb_window": 20,
+      "bb_std": 2.0,
+      "volume_window": 20,
+      "include_calendar_features": false,
+      "calendar_source": "mock",
+      "dropna": true
+    },
+    "created_at": "2026-06-21T21:11:17.204119+00:00"
+  }
+}
