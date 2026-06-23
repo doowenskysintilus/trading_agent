@@ -1,13 +1,16 @@
 """
 MomentumAlpha
 =============
-Signal based on short-term vs long-term EMA crossover + RSI filter.
+Signal based on EMA crossover + RSI filter, using pre-computed feature columns.
 
-BUY  when fast EMA crosses above slow EMA and RSI < overbought threshold.
-SELL when fast EMA crosses below slow EMA and RSI > oversold threshold.
+BUY  when ema_diff crosses from negative to positive AND rsi_norm < overbought.
+SELL when ema_diff crosses from positive to negative AND rsi_norm > oversold.
 HOLD otherwise.
 
-Confidence is derived from the normalised gap between the two EMAs.
+Uses FeatureEngineer output columns (no raw close needed):
+  ema_diff  = (ema_fast - ema_slow) / close   — sign change = crossover
+  ema_ratio = ema_fast / ema_slow             — > 1 bullish, < 1 bearish
+  rsi_norm  = rsi / 100                       — 0–1 range
 """
 
 from __future__ import annotations
@@ -24,77 +27,52 @@ class MomentumAlpha(AlphaModel):
 
     Parameters
     ----------
-    fast_period : int
-        Period of the fast EMA (default 12).
-    slow_period : int
-        Period of the slow EMA (default 26).
-    rsi_period  : int
-        Period for the RSI calculation (default 14).
-    rsi_overbought : float
-        RSI level above which BUY signals are suppressed (default 70).
-    rsi_oversold   : float
-        RSI level below which SELL signals are suppressed (default 30).
+    rsi_overbought : float   RSI level (0–100 scale) above which BUY is suppressed.
+    rsi_oversold   : float   RSI level (0–100 scale) below which SELL is suppressed.
+    min_diff       : float   Minimum |ema_diff| to consider a crossover real (noise filter).
     """
 
     def __init__(
         self,
         name: str = "momentum",
-        fast_period: int = 12,
-        slow_period: int = 26,
-        rsi_period: int = 14,
         rsi_overbought: float = 70.0,
         rsi_oversold: float = 30.0,
+        min_diff: float = 0.00005,   # ~0.5 pip on FX: ignore micro-crossovers
         enabled: bool = True,
     ) -> None:
         super().__init__(name=name, enabled=enabled)
-        self.fast_period    = fast_period
-        self.slow_period    = slow_period
-        self.rsi_period     = rsi_period
-        self.rsi_overbought = rsi_overbought
-        self.rsi_oversold   = rsi_oversold
+        self.rsi_overbought = rsi_overbought / 100.0   # normalise to [0-1]
+        self.rsi_oversold   = rsi_oversold   / 100.0
+        self.min_diff       = min_diff
 
     def compute(self, data: pd.DataFrame) -> AlphaSignal:
-        close = data["close"].astype(float)
+        missing = {"ema_diff", "rsi_norm"} - set(data.columns)
+        if missing:
+            return self._hold(reason=f"missing_features:{','.join(missing)}")
 
-        min_rows = self.slow_period + self.rsi_period + 2
-        if len(close) < min_rows:
-            return self._hold(reason="insufficient_data", rows=len(close))
+        if len(data) < 2:
+            return self._hold(reason="insufficient_data", rows=len(data))
 
-        fast_ema = close.ewm(span=self.fast_period, adjust=False).mean()
-        slow_ema = close.ewm(span=self.slow_period, adjust=False).mean()
-        rsi      = self._compute_rsi(close)
+        diff_now  = float(data["ema_diff"].iloc[-1])
+        diff_prev = float(data["ema_diff"].iloc[-2])
+        rsi_now   = float(data["rsi_norm"].iloc[-1])
 
-        gap_now  = fast_ema.iloc[-1] - slow_ema.iloc[-1]
-        gap_prev = fast_ema.iloc[-2] - slow_ema.iloc[-2]
-        rsi_now  = rsi.iloc[-1]
-
-        # Normalised confidence: EMA gap as a fraction of price
-        confidence = float(np.clip(abs(gap_now) / close.iloc[-1], 0.0, 1.0))
+        # Confidence: how wide the gap is relative to a 1% move (cap at 1.0)
+        confidence = float(np.clip(abs(diff_now) / 0.01, 0.0, 1.0))
 
         meta = {
-            "fast_ema": round(fast_ema.iloc[-1], 5),
-            "slow_ema": round(slow_ema.iloc[-1], 5),
-            "ema_gap":  round(gap_now, 5),
-            "rsi":      round(rsi_now, 2),
+            "ema_diff": round(diff_now,  6),
+            "rsi":      round(rsi_now * 100, 1),
         }
 
-        # Bullish crossover
-        if gap_prev <= 0 and gap_now > 0 and rsi_now < self.rsi_overbought:
+        # Bullish crossover: diff crosses zero upward + not overbought
+        if (diff_prev <= 0 and diff_now > self.min_diff
+                and rsi_now < self.rsi_overbought):
             return self._buy(confidence, **meta)
 
-        # Bearish crossover
-        if gap_prev >= 0 and gap_now < 0 and rsi_now > self.rsi_oversold:
+        # Bearish crossover: diff crosses zero downward + not oversold
+        if (diff_prev >= 0 and diff_now < -self.min_diff
+                and rsi_now > self.rsi_oversold):
             return self._sell(confidence, **meta)
 
         return self._hold(**meta)
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _compute_rsi(self, close: pd.Series) -> pd.Series:
-        delta  = close.diff()
-        gain   = delta.clip(lower=0).ewm(com=self.rsi_period - 1, adjust=False).mean()
-        loss   = (-delta.clip(upper=0)).ewm(com=self.rsi_period - 1, adjust=False).mean()
-        rs     = gain / (loss + 1e-10)
-        return 100 - (100 / (1 + rs))

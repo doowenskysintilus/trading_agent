@@ -105,16 +105,26 @@ class WinClassifier:
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y, dtype=np.int64)
 
-        # Hold out a small test split when there is enough data.
+        # Temporal (chronological) split — never mix future data into training.
+        # Random splitting would leak future trades into the training set.
         if n >= 60:
-            X_tr, X_te, y_tr, y_te = train_test_split(
-                X, y, test_size=0.25, random_state=42, stratify=y,
-            )
+            split      = int(n * 0.75)
+            X_tr, X_te = X[:split], X[split:]
+            y_tr, y_te = y[:split], y[split:]
+            # Ensure both splits have both classes
+            if len(np.unique(y_te)) < 2:
+                # Fall back to training-set evaluation with a warning
+                X_te, y_te = X_tr, y_tr
         else:
             X_tr, X_te, y_tr, y_te = X, X, y, y
 
         model = GradientBoostingClassifier(
-            n_estimators=200, max_depth=3, learning_rate=0.05, random_state=42,
+            n_estimators=100,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.8,          # stochastic gradient boosting — reduces overfit
+            min_samples_leaf=5,     # prevents learning single-sample patterns
+            random_state=42,
         )
         model.fit(X_tr, y_tr)
 

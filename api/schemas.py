@@ -85,10 +85,10 @@ class RetrainRequest(BaseModel):
     train_rl:        bool = Field(default=False)
     rl_timesteps:    int  = Field(default=50_000, ge=1_000, le=2_000_000)
     rl_history_bars: int  = Field(
-        default=5_000,
+        default=0,
         ge=0,
         le=500_000,
-        description="0 = use maximum available history for symbol/timeframe",
+        description="0 = fetch ALL available history from broker (recommended)",
     )
     rl_continuous:   bool = Field(default=False)
     rl_interval_s:   int  = Field(default=1_800, ge=60, le=86_400)

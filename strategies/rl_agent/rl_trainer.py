@@ -93,13 +93,49 @@ except ImportError:
 
 @dataclass
 class RewardConfig:
-    """Weights for the composite reward function."""
+    """
+    Weights for the composite reward function.
 
+    The reward has two categories:
+
+    EXTRINSIC (from the market — realised outcomes):
+      pnl_reward      : normalised equity change per step
+      drawdown_penalty: penalises drawdowns from the equity high-water mark
+      risk_penalty    : penalises holding through high volatility
+      sharpe_bonus    : rewards consistent risk-adjusted returns
+
+    INTRINSIC (from the agent itself — shape exploration behaviour):
+      anti_hold_penalty: penalises excessive inaction when the market moves.
+                         Without this the agent learns HOLD=safe and never
+                         takes BUY positions (root cause of 291 SELL / 0 BUY).
+      entry_quality_bonus: rewards entering a position aligned with short-term
+                           momentum (buy when recent return > 0, sell when < 0).
+                           Intrinsic because it fires at entry, before any P&L.
+      novelty_bonus   : small reward for acting in high-volatility states the
+                        agent has rarely visited (exploration drive).
+    """
+
+    # ---- Extrinsic weights -----------------------------------------------
     alpha_drawdown:   float = 2.0   # drawdown penalty coefficient
     alpha_risk:       float = 0.5   # volatility-adjusted exposure penalty
     alpha_sharpe:     float = 0.3   # Sharpe component weight
     sharpe_window:    int   = 20    # bars for rolling Sharpe estimate
     pnl_scale:        float = 100.0 # scale P&L component (keeps reward ~[-1, 1])
+
+    # ---- Intrinsic weights -----------------------------------------------
+    # Anti-HOLD: penalty per bar of idle position when market is moving.
+    # Kicks in after `hold_threshold` consecutive HOLD bars.
+    # Prevents the agent from learning that "do nothing = no loss = reward 0".
+    alpha_anti_hold:  float = 0.05
+    hold_threshold:   int   = 5     # bars of HOLD before penalty activates
+
+    # Entry quality: bonus when opening a position aligned with short-term
+    # momentum (log_return × direction > 0). Fired once at entry, not per-bar.
+    alpha_entry:      float = 0.15
+
+    # Novelty: small bonus for acting (non-HOLD) when market volatility is
+    # above the session median — encourages exploration in uncertain states.
+    alpha_novelty:    float = 0.08
 
 
 # ---------------------------------------------------------------------------
@@ -120,14 +156,15 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
 
     def __init__(
         self,
-        features: np.ndarray,           # (n_bars, n_features) — observation features only
+        features: np.ndarray,            # (n_bars, n_features) — observation features only
         reward_cfg: RewardConfig,
-        window_size: int   = 32,
-        initial_balance: float = 100_000.0,
-        spread: float      = 0.0001,
-        sl_pct: float      = 0.02,
-        tp_pct: float      = 0.04,
-        position_size_pct: float = 0.10,
+        window_size: int        = 64,
+        initial_balance: float  = 100_000.0,
+        spread: float           = 0.00002,   # 0.2 pip ECN
+        commission_pct: float   = 0.000035,  # ~3.5 USD/lot one-way
+        sl_pct: float           = 0.02,
+        tp_pct: float           = 0.04,
+        position_size_pct: float = 0.02,
         prices: Optional[np.ndarray] = None,  # (n_bars,) actual close prices for PnL calc
     ) -> None:
         if not _SB3_AVAILABLE:
@@ -137,13 +174,14 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
         # prices: actual close prices used for PnL / SL / TP calculations.
         # Falls back to features[:, 0] when not provided (legacy behaviour),
         # but that only works correctly when the first feature column is a price.
-        self._prices        = prices.astype(np.float32) if prices is not None else None
-        self.reward_cfg     = reward_cfg
-        self.window_size    = window_size
+        self._prices         = prices.astype(np.float32) if prices is not None else None
+        self.reward_cfg      = reward_cfg
+        self.window_size     = window_size
         self.initial_balance = initial_balance
-        self.spread         = spread
-        self.sl_pct         = sl_pct
-        self.tp_pct         = tp_pct
+        self.spread          = spread
+        self.commission_pct  = commission_pct
+        self.sl_pct          = sl_pct
+        self.tp_pct          = tp_pct
         self.position_size_pct = position_size_pct
 
         n_features = features.shape[1]
@@ -164,6 +202,10 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
         self._peak_equity  = initial_balance
         self._equity       = initial_balance
         self._returns: list[float] = []
+        # --- Intrinsic reward state ---
+        self._hold_streak: int = 0         # consecutive HOLD bars (no position)
+        self._prev_position: int = 0       # position at previous step
+        self._vol_history: list[float] = []  # recent vol readings for median
 
     # ------------------------------------------------------------------
 
@@ -174,25 +216,27 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
         options: Optional[dict] = None,
     ):
         super().reset(seed=seed)
-        self._bar          = self.window_size
-        self._balance      = self.initial_balance
-        self._position     = 0
-        self._entry_price  = 0.0
-        self._sl_price     = 0.0
-        self._tp_price     = 0.0
-        self._peak_equity  = self.initial_balance
-        self._equity       = self.initial_balance
-        self._returns      = []
+        self._bar           = self.window_size
+        self._balance       = self.initial_balance
+        self._position      = 0
+        self._entry_price   = 0.0
+        self._sl_price      = 0.0
+        self._tp_price      = 0.0
+        self._peak_equity   = self.initial_balance
+        self._equity        = self.initial_balance
+        self._returns       = []
+        self._hold_streak   = 0
+        self._prev_position = 0
+        self._vol_history   = []
         return self._observe(), {}
 
     def step(self, action: int):
         bar    = self._bar
         close  = self._get_close(bar)
-        prev_equity = self._equity
+        prev_equity   = self._equity
+        prev_position = self._position   # capture BEFORE execute (for intrinsic)
 
         # ---- SL/TP auto-close (applied before agent's action) ----------
-        # If a stop-loss or take-profit was triggered at this bar's price,
-        # force-close the position so the agent learns realistic constraints.
         sl_tp_closed = self._check_sl_tp(close)
         if sl_tp_closed:
             action = 1  # position already closed — treat as HOLD
@@ -206,9 +250,10 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
         terminated = self._bar >= len(self.features) - 1
         truncated  = False
 
-        # ---- Compute composite reward ----------------------------------
+        # ---- Compute composite reward (extrinsic + intrinsic) ----------
         reward = self._compute_reward(
-            prev_equity, reward_components, close, terminated
+            prev_equity, reward_components, close, terminated,
+            action=action, prev_position=prev_position,
         )
 
         return self._observe(), reward, terminated, truncated, {}
@@ -224,27 +269,30 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
 
         # For LONG: SL fires when close <= sl_price, TP when close >= tp_price
         # For SHORT: SL fires when close >= sl_price, TP when close <= tp_price
+        size = self._get_size()
         if self._position == 1:
             if close <= self._sl_price or close >= self._tp_price:
                 exec_price = close - self.spread
-                pnl = (exec_price - self._entry_price) * self._get_size()
-                self._balance += pnl
+                pnl  = (exec_price - self._entry_price) * size
+                pnl -= exec_price * size * self.commission_pct  # close commission
+                self._balance    += pnl
                 self._position    = 0
                 self._entry_price = 0.0
                 self._sl_price    = 0.0
                 self._tp_price    = 0.0
-                self._equity = self._balance
+                self._equity      = self._balance
                 return True
         elif self._position == -1:
             if close >= self._sl_price or close <= self._tp_price:
                 exec_price = close + self.spread
-                pnl = (self._entry_price - exec_price) * self._get_size()
-                self._balance += pnl
+                pnl  = (self._entry_price - exec_price) * size
+                pnl -= exec_price * size * self.commission_pct  # close commission
+                self._balance    += pnl
                 self._position    = 0
                 self._entry_price = 0.0
                 self._sl_price    = 0.0
                 self._tp_price    = 0.0
-                self._equity = self._balance
+                self._equity      = self._balance
                 return True
         return False
 
@@ -255,10 +303,12 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
 
         pnl = 0.0
         if self._position != 0 and (action == 0 or direction != self._position):
-            # Close by agent signal
+            # Close by agent signal (spread + commission)
             exec_price = close - spread * self._position
-            raw_pnl    = (exec_price - self._entry_price) * self._position
-            pnl        = raw_pnl * self._get_size()
+            size       = self._get_size()
+            raw_pnl    = (exec_price - self._entry_price) * self._position * size
+            commission = exec_price * size * self.commission_pct
+            pnl        = raw_pnl - commission
             self._balance += pnl
             self._position    = 0
             self._entry_price = 0.0
@@ -266,8 +316,11 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
             self._tp_price    = 0.0
 
         if action != 1 and self._position == 0:
-            # Open new position — set SL/TP levels
+            # Open new position: pay spread + entry commission, set SL/TP
             exec_price        = close + spread * direction
+            size              = self._get_size()
+            open_commission   = exec_price * size * self.commission_pct
+            self._balance    -= open_commission   # deduct immediately on open
             self._position    = direction
             self._entry_price = exec_price
             if direction == 1:
@@ -315,38 +368,101 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
         components: dict,
         close: float,
         done: bool,
+        action: int = 1,
+        prev_position: int = 0,
     ) -> float:
         cfg = self.reward_cfg
+        bar = max(0, self._bar - 1)  # bar just processed
 
-        # 1. P&L component
+        # ------------------------------------------------------------------
+        # EXTRINSIC REWARDS (from the market)
+        # ------------------------------------------------------------------
+
+        # E1. P&L component — normalised equity change
         delta_equity = self._equity - prev_equity
         pnl_reward   = (delta_equity / (self.initial_balance + 1e-10)) * cfg.pnl_scale
-
-        # Track returns for Sharpe
         ret = delta_equity / (prev_equity + 1e-10)
         self._returns.append(ret)
 
-        # 2. Drawdown penalty
+        # E2. Drawdown penalty
         dd = max(0.0, (self._peak_equity - self._equity) / (self._peak_equity + 1e-10))
         drawdown_penalty = cfg.alpha_drawdown * dd
 
-        # 3. Volatility-adjusted exposure penalty
-        recent_vols = self.features[max(0, self._bar - 20): self._bar, :]
-        vol_proxy   = float(np.std(recent_vols[:, 0])) if len(recent_vols) > 1 else 0.0
+        # E3. Volatility-adjusted exposure penalty
+        recent_slice = self.features[max(0, bar - 20): bar + 1, :]
+        vol_proxy    = float(np.std(recent_slice[:, 0])) if len(recent_slice) > 1 else 0.0
         risk_penalty = cfg.alpha_risk * abs(self._position) * vol_proxy * cfg.pnl_scale
 
-        # 4. Sharpe component
+        # E4. Sharpe bonus — rolling risk-adjusted return
         sharpe_bonus = 0.0
         if len(self._returns) >= cfg.sharpe_window:
-            window_rets  = np.array(self._returns[-cfg.sharpe_window:])
-            mean_r, std_r = float(np.mean(window_rets)), float(np.std(window_rets))
-            sharpe_bonus  = cfg.alpha_sharpe * (mean_r / (std_r + 1e-8))
+            window_rets = np.array(self._returns[-cfg.sharpe_window:])
+            mean_r = float(np.mean(window_rets))
+            std_r  = float(np.std(window_rets))
+            sharpe_bonus = cfg.alpha_sharpe * (mean_r / (std_r + 1e-8))
 
-        reward = pnl_reward - drawdown_penalty - risk_penalty + sharpe_bonus
+        # E5. Terminal penalty — deep drawdown = failed episode
+        terminal_penalty = 10.0 if (done and dd > 0.25) else 0.0
 
-        # Terminal penalty if deep drawdown
-        if done and dd > 0.25:
-            reward -= 10.0
+        # ------------------------------------------------------------------
+        # INTRINSIC REWARDS (from the agent — shape exploration behaviour)
+        # ------------------------------------------------------------------
+
+        # Track vol history for novelty detection (rolling median)
+        self._vol_history.append(vol_proxy)
+        if len(self._vol_history) > 100:
+            self._vol_history.pop(0)
+
+        # I1. Anti-HOLD penalty
+        # Without this the agent defaults to HOLD=0 loss, learning to never
+        # trade. Penalty grows with consecutive HOLD bars when market moves.
+        if self._position == 0 and action == 1:  # idle (HOLD, no position)
+            self._hold_streak += 1
+        else:
+            self._hold_streak = 0
+
+        anti_hold_penalty = 0.0
+        if self._hold_streak > cfg.hold_threshold and vol_proxy > 1e-5:
+            # Penalty proportional to how long the agent has been idle and
+            # how much the market is moving (vol_proxy ≈ std of log_returns).
+            idle_excess      = self._hold_streak - cfg.hold_threshold
+            anti_hold_penalty = cfg.alpha_anti_hold * vol_proxy * min(idle_excess, 20)
+
+        # I2. Entry quality bonus
+        # Fires ONCE when the agent opens a new position.
+        # Rewards momentum alignment: BUY when log_return > 0, SELL when < 0.
+        # This is intrinsic: it fires before any P&L is realised.
+        entry_bonus = 0.0
+        just_opened = (prev_position == 0 and self._position != 0)
+        if just_opened and bar < len(self.features):
+            log_ret   = float(self.features[bar, 0])  # col 0 = log_return
+            alignment = log_ret * self._position       # +1 = aligned with momentum
+            if alignment > 0:
+                entry_bonus = cfg.alpha_entry * abs(alignment) * 100
+
+        # I3. Novelty bonus
+        # Small reward for taking action (non-HOLD) when the current volatility
+        # is above the agent's recent median — encourages exploring unusual states.
+        novelty_bonus = 0.0
+        if action != 1 and len(self._vol_history) >= 10:
+            median_vol = float(np.median(self._vol_history))
+            if vol_proxy > median_vol * 1.2:   # 20% above median = "unusual"
+                novelty_bonus = cfg.alpha_novelty * (vol_proxy - median_vol)
+
+        # ------------------------------------------------------------------
+        # Composite reward
+        # ------------------------------------------------------------------
+        reward = (
+            pnl_reward
+            - drawdown_penalty
+            - risk_penalty
+            + sharpe_bonus
+            - terminal_penalty
+            # intrinsic
+            - anti_hold_penalty
+            + entry_bonus
+            + novelty_bonus
+        )
 
         return float(np.clip(reward, -10.0, 10.0))
 
@@ -400,12 +516,13 @@ class RLTrainerConfig:
     # test is the remainder
 
     # ---- Environment ----------------------------------------------------
-    window_size: int     = 32
-    initial_balance: float = 100_000.0
-    spread: float        = 0.0001
-    sl_pct: float        = 0.02
-    tp_pct: float        = 0.04
-    position_size_pct: float = 0.10
+    window_size: int          = 64       # 64h ≈ 3 trading days context (was 32)
+    initial_balance: float    = 100_000.0
+    spread: float             = 0.00002  # 0.2 pip — realistic ECN spread (was 0.0001)
+    commission_pct: float     = 0.000035 # ~3.5 USD/lot one-way commission
+    sl_pct: float             = 0.02
+    tp_pct: float             = 0.04
+    position_size_pct: float  = 0.02     # 2% per trade (was 10% — dangerously high)
     reward_config: RewardConfig = field(default_factory=RewardConfig)
 
     # ---- LSTM architecture ----------------------------------------------
@@ -415,24 +532,24 @@ class RLTrainerConfig:
     net_arch: list       = field(default_factory=lambda: [dict(pi=[64, 64], vf=[64, 64])])
 
     # ---- PPO hyperparameters --------------------------------------------
-    use_recurrent_ppo: bool  = True    # use sb3-contrib RecurrentPPO if available
-    learning_rate: float     = 3e-4
-    n_steps: int             = 512     # rollout length
-    batch_size: int          = 64
-    n_epochs: int            = 10
-    gamma: float             = 0.99
-    gae_lambda: float        = 0.95
-    clip_range: float        = 0.2
-    ent_coef: float          = 0.01    # entropy regularisation (exploration)
-    vf_coef: float           = 0.5
-    max_grad_norm: float     = 0.5
+    use_recurrent_ppo: bool   = True
+    learning_rate: float      = 2e-4    # slightly lower for stability
+    n_steps: int              = 1024    # longer rollout = better value estimates (was 512)
+    batch_size: int           = 64
+    n_epochs: int             = 10
+    gamma: float              = 0.99
+    gae_lambda: float         = 0.95
+    clip_range: float         = 0.2
+    ent_coef: float           = 0.03    # higher entropy = more exploration (was 0.01)
+    vf_coef: float            = 0.5
+    max_grad_norm: float      = 0.5
     normalize_advantage: bool = True
 
     # ---- Training schedule ----------------------------------------------
-    total_timesteps: int     = 500_000
-    eval_freq: int           = 10_000
-    n_eval_episodes: int     = 5
-    checkpoint_freq: int     = 50_000
+    total_timesteps: int      = 3_000_000   # 3M steps (was 500k — far too few)
+    eval_freq: int            = 25_000
+    n_eval_episodes: int      = 5
+    checkpoint_freq: int      = 100_000
 
     # ---- Resume / warm-start --------------------------------------------
     # When True, train() continues from the last saved model (if present)
@@ -619,10 +736,16 @@ class RLTrainer:
         if not np.isfinite(features).all():
             raise ValueError("Non-finite values found in RL feature matrix.")
 
+        # Structural minimum: enough bars for a proper train/val/test split where
+        # each split has at least window_size+2 usable steps.
+        # window_size*4 ensures: 70% train ≥ window_size, 15% val ≥ window_size.
         min_required = max(cfg.window_size * 4, int(cfg.min_history_bars))
         if len(features) < min_required:
             raise ValueError(
-                f"RL history too short: got {len(features)} bars, need at least {min_required}."
+                f"RL history too short: got {len(features)} bars, need at least "
+                f"{min_required} (window_size={cfg.window_size} × 4). "
+                f"Fix: set TRADING_RL_TIMEFRAME=H1 in .env so RL trains on H1 bars "
+                f"(years of history), not {cfg.timeframe} (few hundred bars)."
             )
 
         n = len(features)
@@ -673,15 +796,16 @@ class RLTrainer:
 
         def _init():
             env = RLTradingEnv(
-                features         = features,
-                reward_cfg       = cfg.reward_config,
-                window_size      = cfg.window_size,
-                initial_balance  = cfg.initial_balance,
-                spread           = cfg.spread,
-                sl_pct           = cfg.sl_pct,
-                tp_pct           = cfg.tp_pct,
-                position_size_pct= cfg.position_size_pct,
-                prices           = prices,
+                features          = features,
+                reward_cfg        = cfg.reward_config,
+                window_size       = cfg.window_size,
+                initial_balance   = cfg.initial_balance,
+                spread            = cfg.spread,
+                commission_pct    = cfg.commission_pct,
+                sl_pct            = cfg.sl_pct,
+                tp_pct            = cfg.tp_pct,
+                position_size_pct = cfg.position_size_pct,
+                prices            = prices,
             )
             return Monitor(env)
 

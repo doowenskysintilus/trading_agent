@@ -706,6 +706,15 @@ class MT5ExecutionEngine:
             # ---- Success ------------------------------------------------
             if retcode in _SUCCESS_CODES:
                 fill_price = result.price
+                # MT5 sometimes returns price=0 for immediately-filled market
+                # orders on certain brokers (FTMO, IC Markets ECN).
+                # Fall back to bid/ask at fill time, then to the requested price.
+                if fill_price == 0.0:
+                    is_buy = request.get("type") == mt5.ORDER_TYPE_BUY
+                    fill_price = (
+                        getattr(result, "ask", 0.0) if is_buy
+                        else getattr(result, "bid", 0.0)
+                    ) or requested_price
                 slippage   = (fill_price - requested_price) * (
                     1 if request.get("type") == mt5.ORDER_TYPE_BUY else -1
                 )

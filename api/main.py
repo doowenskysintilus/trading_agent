@@ -75,41 +75,39 @@ from research.feature_store.calendar_provider import CalendarProvider, EventImpo
 # RL feature provider
 # ---------------------------------------------------------------------------
 
-def _resolve_mt5_history_bars(symbol: str, timeframe: str, requested_bars: int) -> int:
-    """Resolve how many bars to request from MT5.
+def _fetch_full_mt5_history(symbol: str, timeframe: str) -> "np.ndarray | None":
+    """Fetch the complete available MT5 history for a symbol/timeframe.
 
-    If ``requested_bars`` is > 0, it is used as-is.
-    If ``requested_bars`` is <= 0, this probes MT5 to estimate the maximum
-    available bars for the given symbol/timeframe (bounded by terminal maxbars).
+    Uses copy_rates_range() from the earliest tradeable date (year 2000) to
+    now so we get every bar the broker has on record — regardless of how many
+    bars the terminal has loaded in RAM.
+
+    For EURUSD H1 this typically yields 80 000 – 200 000 bars (2001 → today).
+    For BTCUSD H1 it yields whatever the broker has stored (often from 2014+).
+
+    Returns a numpy structured array (same format as copy_rates_from_pos) or
+    None on failure.
     """
-    if int(requested_bars) > 0:
-        return int(requested_bars)
-
     try:
         import MetaTrader5 as mt5
+        from datetime import datetime, timezone
         from live_trading.live_trader import _get_mt5_tf
 
-        tf = _get_mt5_tf(timeframe)
-        term = mt5.terminal_info()
-        maxbars = int(getattr(term, "maxbars", 0) or 0)
-        hard_cap = maxbars if maxbars > 0 else 300_000
+        tf  = _get_mt5_tf(timeframe)
+        t0  = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
 
-        probes = [2_000, 10_000, 50_000, 100_000, hard_cap]
-        probes = sorted({p for p in probes if p > 0 and p <= hard_cap})
-
-        best = 0
-        for count in probes:
-            rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
-            got = len(rates) if rates is not None else 0
-            best = max(best, got)
-            if got < count:
-                # Reached the actual history ceiling for this timeframe.
-                return max(200, got)
-
-        return max(200, best)
+        rates = mt5.copy_rates_range(symbol, tf, t0, now)
+        got   = len(rates) if rates is not None else 0
+        logger.info(
+            "Full history fetch: %s %s — %d bars from %s to %s",
+            symbol, timeframe, got, t0.date(), now.date(),
+        )
+        return rates if got > 0 else None
     except Exception as exc:
-        logger.warning("RL history auto-size failed for %s %s: %s", symbol, timeframe, exc)
-        return 5_000
+        logger.warning("Full history fetch failed for %s %s: %s", symbol, timeframe, exc)
+        return None
+
 
 def _make_rl_feature_provider(
     symbol: str,
@@ -117,13 +115,15 @@ def _make_rl_feature_provider(
     n_bars: int,
     feature_config=None,
 ):
-    """Build a callable that returns a continuous feature DataFrame for RL.
+    """Build a callable that returns a complete historical feature DataFrame.
 
-    Pulls ``n_bars`` recent OHLCV bars from MT5 and runs the same
-    FeatureEngineer the live trader uses, so the RL agent is trained on a
-    feature layout consistent with live inference. Returns ``None`` when MT5
-    or the feature stack is unavailable, in which case the trainer falls back
-    to the FeatureStore.
+    Strategy (in order):
+    1. copy_rates_range(symbol, tf, 2000-01-01, now)  — full broker history
+    2. If that fails, fall back to copy_rates_from_pos with a large n_bars
+       (or auto-detected maximum when n_bars=0).
+
+    The result is every single bar the broker has available for the symbol
+    and timeframe — potentially 20+ years of H1 data for major FX pairs.
     """
     def _provider():
         import pandas as pd
@@ -134,15 +134,21 @@ def _make_rl_feature_provider(
             return None
 
         from live_trading.live_trader import _get_mt5_tf
-        from research.feature_store.feature_engineer import (
-            FeatureConfig, FeatureEngineer,
-        )
+        from research.feature_store.feature_engineer import FeatureConfig, FeatureEngineer
 
-        resolved_bars = _resolve_mt5_history_bars(symbol, timeframe, n_bars)
-        rates = mt5.copy_rates_from_pos(symbol, _get_mt5_tf(timeframe), 0, resolved_bars)
+        # --- Step 1: fetch ALL available history via date range ---------------
+        rates = _fetch_full_mt5_history(symbol, timeframe)
+
+        # --- Step 2: fallback — large positional fetch if range failed --------
         if rates is None or len(rates) == 0:
-            logger.warning("RL feature provider: MT5 returned no bars for %s %s.",
-                           symbol, timeframe)
+            tf_mt5    = _get_mt5_tf(timeframe)
+            term      = mt5.terminal_info()
+            maxbars   = int(getattr(term, "maxbars", 0) or 0) or 300_000
+            fetch_n   = n_bars if n_bars > 0 else maxbars
+            rates = mt5.copy_rates_from_pos(symbol, tf_mt5, 0, fetch_n)
+
+        if rates is None or len(rates) == 0:
+            logger.warning("RL feature provider: no bars available for %s %s.", symbol, timeframe)
             return None
 
         df = pd.DataFrame(rates)
@@ -152,14 +158,14 @@ def _make_rl_feature_provider(
 
         engineer = FeatureEngineer(feature_config or FeatureConfig())
         features = engineer.compute(df).ffill().fillna(0.0)
+
+        first = df.index[0].strftime("%Y-%m-%d") if len(df) else "?"
+        last  = df.index[-1].strftime("%Y-%m-%d") if len(df) else "?"
         logger.info(
-            "RL feature provider: requested=%d resolved=%d => %d bars x %d features for %s %s.",
-            n_bars,
-            resolved_bars,
-            features.shape[0],
-            features.shape[1],
-            symbol,
-            timeframe,
+            "RL feature provider: %s %s | %d OHLCV bars (%s → %s) → %d features × %d cols",
+            symbol, timeframe,
+            len(df), first, last,
+            features.shape[0], features.shape[1],
         )
         return features
 
@@ -425,17 +431,24 @@ def create_app(
             if cfg is not None:
                 syms = getattr(cfg, "symbols", None)
                 rl_symbol = syms[0] if syms else None
-                rl_tf     = getattr(cfg, "timeframe", None)
+                # RL training uses its own timeframe (H1 by default), separate
+                # from the live-trading timeframe (e.g. M1). This gives RL
+                # access to years of H1 history while live decisions run on M1.
+                rl_tf = (
+                    _cfg.trading.rl_timeframe
+                    or getattr(cfg, "timeframe", None)
+                    or "H1"
+                )
                 feature_config = getattr(cfg, "feature_config", None)
 
         # RL needs a long, continuous price-series history (not the sparse
-        # per-trade experiences). Pull recent bars from MT5 and compute the
-        # SAME features the live trader uses, so the trained agent stays
-        # consistent with live inference.
+        # per-trade experiences). Pull maximum available bars from MT5 and
+        # compute the SAME features the live trader uses so the trained agent
+        # stays consistent with live inference.
         rl_feature_provider = _make_rl_feature_provider(
             symbol         = rl_symbol or "EURUSD",
-            timeframe      = rl_tf or "H1",
-            n_bars         = req.rl_history_bars,
+            timeframe      = rl_tf,
+            n_bars         = req.rl_history_bars,   # 0 = auto all available
             feature_config = feature_config,
         )
 
@@ -1250,10 +1263,13 @@ def create_app(
                     timeframe = getattr(cfg, "timeframe", None) or timeframe
                     feature_config = getattr(cfg, "feature_config", None)
 
+            # RL always trains on its own dedicated timeframe (H1 by default),
+            # independent of the M1/M5 live-trading timeframe.
+            rl_tf = _cfg.trading.rl_timeframe or "H1"
             provider = _make_rl_feature_provider(
                 symbol=symbol,
-                timeframe=timeframe,
-                n_bars=_cfg.trading.rl_history_bars,
+                timeframe=rl_tf,
+                n_bars=_cfg.trading.rl_history_bars,   # 0 = auto all available
                 feature_config=feature_config,
             )
 

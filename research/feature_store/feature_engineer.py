@@ -3,22 +3,32 @@ FeatureEngineer
 ===============
 Computes technical indicators and statistical features from raw OHLCV data.
 
-Supported features
-------------------
-- Returns        : log_return, pct_return
-- Volatility     : rolling_volatility, parkinson_volatility
-- Trend          : ema_fast, ema_slow, ema_diff
-- Momentum       : rsi, macd_line, macd_signal, macd_hist
-- Volatility ATR : atr, natr (normalised)
-- Volume         : volume_change, volume_zscore
-- Bollinger      : bb_upper, bb_lower, bb_width, bb_pct
-- Economic       : event_is_active, event_hours_until, event_vol_expectation (optional)
+All output features are NORMALISED (no raw prices, no non-stationary columns).
+This is critical for ML/RL models to generalise across price levels and time.
+
+Output features (all bounded / stationary)
+-------------------------------------------
+Returns      : log_return, return_5b, return_10b
+Volatility   : volatility, parkinson_vol
+Bar structure: high_low_range, close_position, gap
+EMA (norm.)  : ema_diff, ema_ratio
+RSI (norm.)  : rsi_norm  (0–1)
+MACD (norm.) : macd_line, macd_signal, macd_hist  (divided by close)
+ATR (norm.)  : natr
+Bollinger    : bb_width, bb_pct
+Volume       : volume_zscore, volume_change_clipped
+Time (cyclic): hour_sin, hour_cos, dow_sin, dow_cos
+Calendar     : event_is_active, event_hours_until, event_vol_expectation (opt.)
+
+Removed (non-stationary / raw prices):
+  ema_fast, ema_slow, bb_upper, bb_lower, atr (absolute),
+  pct_return (≈ log_return), open, high, low, close, volume (raw)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -40,8 +50,8 @@ except ImportError:
 class FeatureConfig:
     """Controls which feature groups are computed and their parameters."""
 
-    # Returns
-    returns_periods: list[int] = field(default_factory=lambda: [1, 5, 10])
+    # Returns (multi-period log returns)
+    returns_periods: list[int] = field(default_factory=lambda: [5, 10])
 
     # Volatility
     volatility_window: int = 20
@@ -69,9 +79,15 @@ class FeatureConfig:
     # Volume
     volume_window: int = 20
 
-    # Economic Calendar (Phase 1: add event features)
+    # Time-of-day / day-of-week cyclic encoding
+    # Requires a DatetimeIndex on the input DataFrame.
+    include_time_features: bool = True
+
+    # Economic Calendar
+    # WARNING: only enable in LIVE inference, NOT in historical training.
+    # Historical rows will receive the current event snapshot, not historical ones.
     include_calendar_features: bool = False
-    calendar_source: str = "mock"  # "mock", "cache", "fred", "trading_economics"
+    calendar_source: str = "mock"
 
     # Drop NaN rows created by long-period indicators
     dropna: bool = True
@@ -83,17 +99,21 @@ class FeatureConfig:
 
 class FeatureEngineer:
     """
-    Transforms a raw OHLCV DataFrame into a feature matrix ready for ML.
+    Transforms a raw OHLCV DataFrame into a normalised feature matrix.
+
+    All output columns are stationary and bounded so that ML / RL models
+    trained on one date range generalise to other date ranges.
+    Raw prices (EMA levels, Bollinger levels, ATR in price units, OHLCV) are
+    NEVER included in the output.
 
     Parameters
     ----------
     config : FeatureConfig
-        Controls which indicators are computed and with which parameters.
 
     Usage
     -----
-        eng = FeatureEngineer()
-        features = eng.compute(df)           # pd.DataFrame
+        eng  = FeatureEngineer()
+        feat = eng.compute(df)   # pd.DataFrame, all columns normalised
     """
 
     def __init__(self, config: FeatureConfig | None = None) -> None:
@@ -116,17 +136,12 @@ class FeatureEngineer:
         ----------
         data : pd.DataFrame
             Must contain lowercase columns: open, high, low, close, volume.
-        symbol : str, optional
-            Trading pair (e.g., "EURUSD") for calendar features.
-        calendar_provider : CalendarProvider, optional
-            Provider for economic event data. If None and
-            include_calendar_features=True, will auto-create from config.
+            A DatetimeIndex is required when include_time_features=True.
 
         Returns
         -------
         pd.DataFrame
-            Feature matrix indexed like `data`. NaN rows are dropped if
-            config.dropna is True.
+            Normalised feature matrix. No raw price columns.
         """
         df = data.copy()
         self._validate(df)
@@ -138,17 +153,20 @@ class FeatureEngineer:
         open_  = df["open"].astype(float)
 
         features = pd.DataFrame(index=df.index)
+        cfg      = self.config
 
-        # ---- Returns -----------------------------------------------------
+        # ----------------------------------------------------------------
+        # 1. Returns (stationary, small magnitude)
+        # ----------------------------------------------------------------
         log_ret = np.log(close / close.shift(1))
         features["log_return"] = log_ret
-        features["pct_return"] = close.pct_change()
 
-        for p in self.config.returns_periods:
+        for p in cfg.returns_periods:
             features[f"return_{p}b"] = np.log(close / close.shift(p))
 
-        # ---- Rolling volatility (annualised) -----------------------------
-        cfg = self.config
+        # ----------------------------------------------------------------
+        # 2. Volatility (annualised — bounded, positive)
+        # ----------------------------------------------------------------
         features["volatility"] = (
             log_ret.rolling(cfg.volatility_window).std() * np.sqrt(252)
         )
@@ -160,62 +178,92 @@ class FeatureEngineer:
                 * np.sqrt(252)
             )
 
-        # ---- EMA trend ---------------------------------------------------
+        # ----------------------------------------------------------------
+        # 3. Bar structure (all relative to bar range / close)
+        # ----------------------------------------------------------------
+        bar_range = high - low
+        features["high_low_range"]  = bar_range / (close + 1e-10)   # range / price
+        features["close_position"]  = (close - low) / (bar_range + 1e-10)  # 0–1
+        features["gap"]             = (open_ - close.shift(1)) / (close.shift(1) + 1e-10)
+
+        # ----------------------------------------------------------------
+        # 4. EMA — only normalised derivatives (no raw price levels)
+        # ----------------------------------------------------------------
         ema_fast = close.ewm(span=cfg.ema_fast, adjust=False).mean()
         ema_slow = close.ewm(span=cfg.ema_slow, adjust=False).mean()
 
-        features["ema_fast"]  = ema_fast
-        features["ema_slow"]  = ema_slow
-        features["ema_diff"]  = (ema_fast - ema_slow) / close       # normalised
-        features["ema_ratio"] = ema_fast / ema_slow
+        features["ema_diff"]  = (ema_fast - ema_slow) / (close + 1e-10)  # ≈ ±0.003
+        features["ema_ratio"] = ema_fast / (ema_slow + 1e-10)             # ≈ 1.000 ± small
 
-        # ---- RSI ---------------------------------------------------------
-        features["rsi"] = self._rsi(close, cfg.rsi_period)
+        # ----------------------------------------------------------------
+        # 5. RSI — normalised to [0, 1]
+        # ----------------------------------------------------------------
+        features["rsi_norm"] = self._rsi(close, cfg.rsi_period) / 100.0
 
-        # ---- MACD --------------------------------------------------------
-        macd_line, macd_signal, macd_hist = self._macd(
+        # ----------------------------------------------------------------
+        # 6. MACD — divided by close price (removes price level)
+        # ----------------------------------------------------------------
+        macd_line, macd_sig, macd_hist = self._macd(
             close, cfg.macd_fast, cfg.macd_slow, cfg.macd_signal
         )
-        features["macd_line"]   = macd_line / close    # normalised
-        features["macd_signal"] = macd_signal / close
-        features["macd_hist"]   = macd_hist / close
+        features["macd_line"]   = macd_line   / (close + 1e-10)
+        features["macd_signal"] = macd_sig    / (close + 1e-10)
+        features["macd_hist"]   = macd_hist   / (close + 1e-10)
 
-        # ---- ATR ---------------------------------------------------------
+        # ----------------------------------------------------------------
+        # 7. ATR — only normalised (natr = atr / close)
+        # ----------------------------------------------------------------
         atr = self._atr(high, low, close, cfg.atr_period)
-        features["atr"]  = atr
-        features["natr"] = atr / close                 # normalised ATR
+        features["natr"] = atr / (close + 1e-10)   # ≈ 0.001–0.010 for FX
 
-        # ---- Bollinger Bands ---------------------------------------------
+        # ----------------------------------------------------------------
+        # 8. Bollinger Bands — only normalised derivatives
+        # ----------------------------------------------------------------
         bb_mid   = close.rolling(cfg.bb_window).mean()
-        bb_std   = close.rolling(cfg.bb_window).std(ddof=0)
-        bb_upper = bb_mid + cfg.bb_std * bb_std
-        bb_lower = bb_mid - cfg.bb_std * bb_std
-        bb_width = (bb_upper - bb_lower) / (bb_mid + 1e-10)
-        bb_pct   = (close - bb_lower) / (bb_upper - bb_lower + 1e-10)
+        bb_std_s = close.rolling(cfg.bb_window).std(ddof=0)
+        bb_upper = bb_mid + cfg.bb_std * bb_std_s
+        bb_lower = bb_mid - cfg.bb_std * bb_std_s
 
-        features["bb_upper"] = bb_upper
-        features["bb_lower"] = bb_lower
-        features["bb_width"] = bb_width
-        features["bb_pct"]   = bb_pct
+        features["bb_width"] = (bb_upper - bb_lower) / (bb_mid + 1e-10)  # relative width
+        features["bb_pct"]   = (close - bb_lower) / (bb_upper - bb_lower + 1e-10)  # 0–1
 
-        # ---- Volume features ---------------------------------------------
-        vol_change  = volume.pct_change()
+        # ----------------------------------------------------------------
+        # 9. Volume (z-score + clipped log change)
+        # ----------------------------------------------------------------
         vol_rolling = volume.rolling(cfg.volume_window)
-        vol_zscore  = (volume - vol_rolling.mean()) / (vol_rolling.std(ddof=0) + 1e-10)
+        features["volume_zscore"] = (
+            (volume - vol_rolling.mean()) / (vol_rolling.std(ddof=0) + 1e-10)
+        ).clip(-4, 4)
 
-        features["volume_change"] = vol_change
-        features["volume_zscore"] = vol_zscore
+        # Log-signed volume change avoids extreme outliers from volume spikes
+        vol_chg = volume.pct_change().clip(-1, 10)
+        features["volume_change"] = np.sign(vol_chg) * np.log1p(vol_chg.abs())
 
-        # ---- OHLCV pass-through (raw prices useful for some models) ------
-        for col in ["open", "high", "low", "close", "volume"]:
-            features[col] = df[col].astype(float)
+        # ----------------------------------------------------------------
+        # 10. Time features — cyclic sin/cos encoding
+        # Encodes session (London/NY/Asian) and day-of-week patterns.
+        # Requires DatetimeIndex; silently skipped if index has no time info.
+        # ----------------------------------------------------------------
+        if cfg.include_time_features:
+            try:
+                idx = df.index
+                if not isinstance(idx, pd.DatetimeIndex):
+                    idx = pd.to_datetime(idx, utc=True)
+                hour = idx.hour + idx.minute / 60.0          # 0–24
+                dow  = idx.dayofweek.astype(float)            # 0 Mon … 6 Sun
+                features["hour_sin"] = np.sin(2 * np.pi * hour / 24.0)
+                features["hour_cos"] = np.cos(2 * np.pi * hour / 24.0)
+                features["dow_sin"]  = np.sin(2 * np.pi * dow  /  7.0)
+                features["dow_cos"]  = np.cos(2 * np.pi * dow  /  7.0)
+            except Exception:
+                pass   # Index has no usable time info — skip silently
 
-        # ---- Economic Calendar features (optional) ---------------------
-        if self.config.include_calendar_features and _CALENDAR_AVAILABLE:
+        # ----------------------------------------------------------------
+        # 11. Economic Calendar features (LIVE inference only)
+        # ----------------------------------------------------------------
+        if cfg.include_calendar_features and _CALENDAR_AVAILABLE:
             if calendar_provider is None and symbol:
-                # Auto-create provider from config
-                calendar_provider = CalendarProvider(source=self.config.calendar_source)
-            
+                calendar_provider = CalendarProvider(source=cfg.calendar_source)
             if calendar_provider and symbol:
                 features = self._add_calendar_features(
                     features, calendar_provider, symbol, df
@@ -228,16 +276,15 @@ class FeatureEngineer:
 
     @property
     def feature_names(self) -> list[str]:
-        """Return the list of output feature column names (requires one compute call)."""
-        dummy_data = pd.DataFrame({
-            "open":   np.random.rand(100) + 100,
-            "high":   np.random.rand(100) + 101,
-            "low":    np.random.rand(100) + 99,
-            "close":  np.random.rand(100) + 100,
-            "volume": np.random.rand(100) * 1000,
-        })
-        features = self.compute(dummy_data, symbol="EURUSD")
-        return list(features.columns)
+        """Return the column names produced by compute()."""
+        dummy = pd.DataFrame({
+            "open":   np.linspace(1.08, 1.10, 200),
+            "high":   np.linspace(1.09, 1.11, 200),
+            "low":    np.linspace(1.07, 1.09, 200),
+            "close":  np.linspace(1.08, 1.10, 200),
+            "volume": np.random.rand(200) * 1000 + 100,
+        }, index=pd.date_range("2023-01-02 00:00", periods=200, freq="1h", tz="UTC"))
+        return list(self.compute(dummy).columns)
 
     # ------------------------------------------------------------------
     # Indicator implementations
@@ -258,12 +305,11 @@ class FeatureEngineer:
         slow: int,
         signal_period: int,
     ) -> tuple[pd.Series, pd.Series, pd.Series]:
-        ema_fast   = close.ewm(span=fast,   adjust=False).mean()
-        ema_slow   = close.ewm(span=slow,   adjust=False).mean()
-        macd_line  = ema_fast - ema_slow
-        macd_sig   = macd_line.ewm(span=signal_period, adjust=False).mean()
-        macd_hist  = macd_line - macd_sig
-        return macd_line, macd_sig, macd_hist
+        ema_fast  = close.ewm(span=fast,          adjust=False).mean()
+        ema_slow  = close.ewm(span=slow,          adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        macd_sig  = macd_line.ewm(span=signal_period, adjust=False).mean()
+        return macd_line, macd_sig, macd_line - macd_sig
 
     @staticmethod
     def _atr(
@@ -281,74 +327,44 @@ class FeatureEngineer:
         return tr.ewm(com=period - 1, adjust=False).mean()
 
     # ------------------------------------------------------------------
-    # Validation
+    # Calendar features (live only — do NOT use in historical training)
     # ------------------------------------------------------------------
 
     def _add_calendar_features(
         self,
         features: pd.DataFrame,
-        calendar_provider: CalendarProvider,
+        calendar_provider,
         symbol: str,
         original_df: pd.DataFrame,
     ) -> pd.DataFrame:
         """
-        Add economic calendar features to the feature matrix.
-        
-        Adds columns:
-        - event_is_active : bool (is a HIGH-impact event happening now?)
-        - event_hours_until : float (hours until next event, or 999 if none)
-        - event_vol_expectation : float (expected vol multiplier 1.0 - 1.5)
-        
-        Parameters
-        ----------
-        features : pd.DataFrame
-            Current feature matrix to augment
-        calendar_provider : CalendarProvider
-            Provider for event data
-        symbol : str
-            Trading pair
-        original_df : pd.DataFrame
-            Original OHLCV data (for timestamps if available)
-        
-        Returns
-        -------
-        pd.DataFrame
-            Feature matrix with calendar columns added
+        Add economic calendar snapshot features for LIVE inference.
+
+        WARNING: This method uses the CURRENT timestamp, so it is only
+        correct when called in live trading (not historical back-testing).
         """
         try:
-            # Compute calendar features for each row
-            # For MVP, use current time for all rows (static snapshot)
-            is_active = calendar_provider.event_is_active(symbol, window_minutes=30)
+            is_active   = calendar_provider.event_is_active(symbol, window_minutes=30)
             hours_until = calendar_provider.hours_until_next_event(
                 symbol, min_importance=EventImportance.MEDIUM
             ) or 999.0
-            vol_mult = calendar_provider.expected_volatility_multiplier(
+            vol_mult    = calendar_provider.expected_volatility_multiplier(
                 symbol, window_hours=2.0
             )
-            
-            # Broadcast to all rows
-            features["event_is_active"] = float(is_active)
-            features["event_hours_until"] = min(hours_until, 999.0)  # Cap at 999
-            features["event_vol_expectation"] = vol_mult
-            
-            return features
-        
-        except Exception as e:
-            # Graceful fallback if calendar provider fails
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(f"Calendar feature computation failed: {e}. Skipping.")
-            # Fill with neutral values
-            features["event_is_active"] = 0.0
-            features["event_hours_until"] = 999.0
+            features["event_is_active"]       = float(is_active)
+            features["event_hours_until"]     = float(min(hours_until, 999.0))
+            features["event_vol_expectation"] = float(vol_mult)
+        except Exception:
+            features["event_is_active"]       = 0.0
+            features["event_hours_until"]     = 999.0
             features["event_vol_expectation"] = 1.0
-            return features
+        return features
 
     @staticmethod
     def _validate(df: pd.DataFrame) -> None:
         required = {"open", "high", "low", "close", "volume"}
         missing  = required - set(df.columns.str.lower())
         if missing:
-            raise ValueError(f"Missing columns: {missing}")
+            raise ValueError(f"Missing OHLCV columns: {missing}")
         if df.empty:
             raise ValueError("DataFrame is empty.")

@@ -184,6 +184,15 @@ class TradingSettings:
     rl_timesteps: int = field(
         default_factory=lambda: _get_int("TRADING_RL_TIMESTEPS", 50_000)
     )
+    # Timeframe used SPECIFICALLY for RL training history.
+    # Decoupled from the live-trading timeframe so RL trains on longer bars
+    # (H1 / H4) with years of history, while live inference runs on M1.
+    # Set to "" to reuse the live timeframe (not recommended).
+    rl_timeframe: str = field(
+        default_factory=lambda: _get_str("TRADING_RL_TIMEFRAME", "H1")
+    )
+    # Number of bars to fetch for RL training history.
+    # 0 = auto-detect the maximum available from the MT5 terminal.
     rl_history_bars: int = field(
         default_factory=lambda: _get_int("TRADING_RL_HISTORY_BARS", 0)
     )

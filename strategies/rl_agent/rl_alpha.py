@@ -73,14 +73,14 @@ class RLAlpha(AlphaModel):
         name: str = "rl_agent",
         model_path: Optional[str | Path] = None,
         algo: str = "PPO",
-        window_size: int = 32,
+        window_size: int = 64,       # must match RLTrainerConfig.window_size
         deterministic: bool = True,
         reset_lstm_on_compute: bool = False,
         enabled: bool = True,
     ) -> None:
         super().__init__(name=name, enabled=enabled)
 
-        self.window_size            = window_size
+        self.window_size = window_size
         self.deterministic          = deterministic
         self.reset_lstm_on_compute  = reset_lstm_on_compute
         self._model                 = None
