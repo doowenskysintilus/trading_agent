@@ -28,6 +28,11 @@ dashboard/src/accounts.local.js
 
 # ── Data / Models ─────────────────────────────────────────────────────────────
 data/storage/logs/
+data/storage/features/
+data/storage/datasets/
+data/storage/models/
+data/storage/mt5_signals/
+data/storage/EMERGENCY_STOP
 data/market_data/*.parquet
 data/market_data/*.csv
 models/
