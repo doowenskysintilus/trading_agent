@@ -169,6 +169,17 @@ check(not r.passed and "daily_loss" in r.reason, f"-2.5 % today → halted ({r.r
 check(not PersistenceRule(lambda: False).evaluate(EntryContext("BTCUSD", now, 60)).passed,
       "journal down → DB-04 blocks entries")
 
+ftmo = RiskEngine(RiskConfig(ftmo_enabled=True, ftmo_initial_balance=10_000))
+ps_first_win = PortfolioState(equity=10_000.58, balance=10_000.58, peak_equity=10_000.58,
+                              daily_start_equity=10_000, ftmo_initial_balance=10_000,
+                              ftmo_total_profit=0.58, ftmo_today_profit=0.58)
+check(ftmo.check_halt(ps_first_win) is None,
+      "FTMO consistency: first +0.58 $ win (100 % of a tiny total) does not halt the day")
+ps_big_day = dataclasses.replace(ps_first_win, equity=10_150, ftmo_total_profit=150, ftmo_today_profit=150)
+r = ftmo.check_halt(ps_big_day)
+check(r is not None and r.reason.value == "ftmo_consistency_rule",
+      "…but once total profit ≥ 1 % of the challenge, a 100 % day still halts")
+
 conf = ConfidenceRule(0.55, 0.65)
 check(conf.evaluate(EntryContext("BTCUSD", now, 60, decision=decision(conf=0.6), regime="trending")).passed,
       "conf 0.60 trending ≥ 0.55 → OK")
@@ -242,6 +253,7 @@ from monitoring.metrics_store import MetricsStore
 tmp = tempfile.mkdtemp()
 try:
     store = MetricsStore(log_dir=tmp)
+    check(store.connect() is False, "no MySQL config → never connects to the real database")
     store.write_decision({"ts": now, "symbol": "BTCUSD", "verdict": "EXECUTED", "rule_id": None,
                           "ticket": "42", "rules_version": "SR-1.0"})
     rows = store.query_decisions(verdict="EXECUTED")

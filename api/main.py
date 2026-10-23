@@ -1255,11 +1255,8 @@ def create_app(
             from config.settings import settings
 
             mon_cfg = MonitorConfig()
-            try:
-                if settings.mysql.enabled:
-                    mon_cfg.mysql_config = MySQLConfig.from_env()
-            except Exception:
-                pass
+            if settings.mysql.enabled:
+                mon_cfg.mysql_config = MySQLConfig.from_env()
 
             monitor = TradingMonitor(config=mon_cfg)
 

@@ -219,7 +219,10 @@ class MetricsStore:
         mysql_config: MySQLConfig | None = None,
         log_dir: str = "data/storage/logs/metrics",
     ) -> None:
-        self.mysql_cfg  = mysql_config or MySQLConfig()
+        # No config → JSON-only. Never fall back to a default localhost
+        # connection: MYSQL_ENABLED is the only switch, and test monitors
+        # must not write into the real database.
+        self.mysql_cfg  = mysql_config
         self.log_dir    = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -234,6 +237,9 @@ class MetricsStore:
 
     def connect(self) -> bool:
         """Connect to MySQL and ensure tables exist. Returns True on success."""
+        if self.mysql_cfg is None:
+            logger.info("MySQL disabled (MYSQL_ENABLED=false) — JSON-only mode.")
+            return False
         if not _MYSQL_AVAILABLE:
             logger.warning("MySQL unavailable — running in JSON-only mode.")
             return False

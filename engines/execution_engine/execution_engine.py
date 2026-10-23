@@ -435,6 +435,8 @@ class MT5ExecutionEngine:
 
         # ---- Send with retry --------------------------------------------
         result = self._send_with_retry(request, price)
+        if result.is_filled:
+            self._use_actual_open_price(result, direction)
 
         # ---- Track for trailing stop -----------------------------------
         if result.is_filled and trade.stop_loss is None:
@@ -501,7 +503,8 @@ class MT5ExecutionEngine:
             "sl":       round(sl, digits),
             "tp":       tp,
         })
-        ok = bool(res and res.retcode in _SUCCESS_CODES)
+        # 10025 TRADE_RETCODE_NO_CHANGES: the stop is already at that level.
+        ok = bool(res and (res.retcode in _SUCCESS_CODES or res.retcode == 10025))
         if not ok:
             logger.warning("SL modify failed: ticket=%d retcode=%s",
                            ticket, res.retcode if res else "None")
@@ -684,6 +687,26 @@ class MT5ExecutionEngine:
         lots  = max(vol_min, min(lots, vol_max))
 
         return lots
+
+    def _use_actual_open_price(self, result: ExecutionResult, direction: int) -> None:
+        """Replace the fill price with the position's real open price.
+
+        Some brokers (FTMO) return price=0 for instant market fills, so
+        _send_with_retry falls back to the requested price — the recorded
+        entry and slippage are then wrong. The open position knows the truth.
+        """
+        positions = mt5.positions_get(ticket=result.ticket)
+        if not positions:
+            return
+        actual = float(positions[0].price_open)
+        if actual <= 0 or actual == result.fill_price:
+            return
+        info = mt5.symbol_info(positions[0].symbol)
+        point = float(getattr(info, "point", 0.0) or 0.0) if info else 0.0
+        result.fill_price = actual
+        if point > 0 and result.requested_price > 0:
+            result.slippage_points = abs(actual - result.requested_price) / point
+        result.message = f"Filled at {actual:.5f}"
 
     def _deviation_points(self, symbol: str) -> int:
         """Max price deviation accepted by MT5 for a market order, in points."""

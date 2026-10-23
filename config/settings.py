@@ -332,6 +332,7 @@ class ScalpingSettings:
 @dataclass(frozen=True)
 class MySQLSettings:
     """MySQL metrics store settings (optional — falls back to JSONL logs)."""
+    enabled: bool = field(default_factory=lambda: _get_bool("MYSQL_ENABLED", False))
     host: str = field(default_factory=lambda: _get_str("MYSQL_HOST", "localhost"))
     port: int = field(default_factory=lambda: _get_int("MYSQL_PORT", 3306))
     user: str = field(default_factory=lambda: _get_str("MYSQL_USER", "root"))

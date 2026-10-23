@@ -127,6 +127,10 @@ class RiskConfig:
     ftmo_max_drawdown_pct: float    = 0.09         # block at 9 %  (hard limit 10 %)
     ftmo_consistency_enabled: bool  = True
     ftmo_consistency_max_day_pct: float = 0.25     # one day ≤ 25 % of total profit
+    # The share test is meaningless while total profit is tiny: the first
+    # winning trade is always 100 % of the total and would halt the day.
+    # Only enforce it once total profit ≥ this fraction of initial balance.
+    ftmo_consistency_min_profit_pct: float = 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -602,6 +606,7 @@ class RiskEngine:
         # 3. Consistency rule: today's profit ≤ X % of total profit
         if (
             cfg.ftmo_consistency_enabled
+            and ps.ftmo_total_profit >= cfg.ftmo_consistency_min_profit_pct * initial
             and ps.ftmo_total_profit > 0
             and ps.ftmo_today_profit > 0
         ):
