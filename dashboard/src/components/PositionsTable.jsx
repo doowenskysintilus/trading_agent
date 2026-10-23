@@ -4,7 +4,7 @@
 
 export default function PositionsTable({ positions }) {
   if (!positions?.length) {
-    return <div className="empty">No open positions</div>
+    return <div className="empty">Aucune position ouverte</div>
   }
 
   return (
@@ -12,13 +12,13 @@ export default function PositionsTable({ positions }) {
       <table className="pos-table">
         <thead>
           <tr>
-            <th>SYMBOL</th>
-            <th>DIR</th>
-            <th>SIZE</th>
-            <th className="align-right">ENTRY</th>
-            <th className="align-right">CURRENT</th>
-            <th className="align-right">UNREALISED P&L</th>
-            <th>STRATEGY</th>
+            <th>SYMBOLE</th>
+            <th>SENS</th>
+            <th>TAILLE</th>
+            <th className="align-right">ENTRÉE</th>
+            <th className="align-right">ACTUEL</th>
+            <th className="align-right">P&L LATENT</th>
+            <th>STRATÉGIE</th>
           </tr>
         </thead>
         <tbody>

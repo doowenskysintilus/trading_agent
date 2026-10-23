@@ -29,7 +29,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -459,17 +459,19 @@ def create_app(
 
         req = body or RetrainRequest()
 
-        # When the trader is running, retrain RL on its configured symbol/TF.
-        rl_symbol = rl_tf = None
+        # Defaults from .env; a running trader overrides them below. rl_tf
+        # used to stay None without a trader, and every RL run then failed
+        # at the history fetch ("'NoneType' object has no attribute 'upper'").
+        rl_symbol = _cfg.trading.symbols[0] if _cfg.trading.symbols else "EURUSD"
+        rl_tf = _rl_timeframe(_cfg, _cfg.trading.timeframe)
         feature_config = None
         if _state.trader is not None:
             cfg = getattr(_state.trader, "cfg", None)
             if cfg is not None:
                 syms = getattr(cfg, "symbols", None)
-                rl_symbol = syms[0] if syms else None
-                # RL training uses its own timeframe (H1 by default), separate
-                # from the live-trading timeframe (e.g. M1). This gives RL
-                # access to years of H1 history while live decisions run on M1.
+                rl_symbol = syms[0] if syms else rl_symbol
+                # RL training uses its own timeframe (H1 by default, the
+                # scalping timeframe when scalping is enabled — RL-03).
                 rl_tf = _rl_timeframe(_cfg, getattr(cfg, "timeframe", None))
                 feature_config = getattr(cfg, "feature_config", None)
 
@@ -478,7 +480,7 @@ def create_app(
         # compute the SAME features the live trader uses so the trained agent
         # stays consistent with live inference.
         rl_feature_provider = _make_rl_feature_provider(
-            symbol         = rl_symbol or "EURUSD",
+            symbol         = rl_symbol,
             timeframe      = rl_tf,
             n_bars         = req.rl_history_bars,   # 0 = auto all available
             feature_config = feature_config,
@@ -534,19 +536,43 @@ def create_app(
         points: list[dict] = []
         try:
             with progress_file.open("r", encoding="utf-8") as f:
-                lines = f.readlines()
-            for line in lines[-limit:]:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    points.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        points.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
         except OSError as exc:
             raise HTTPException(500, f"Could not read RL progress: {exc}") from exc
 
-        return ok({"points": points, "n": len(points)})
+        # Group points by training run. Older records have no "run" id: a
+        # timestep going backwards marks the start of a new run.
+        runs: list[dict] = []
+        prev_step = None
+        for p in points:
+            run_id = p.get("run")
+            new_run = (
+                not runs
+                or (run_id is not None and run_id != runs[-1]["run"])
+                or (run_id is None and prev_step is not None and p.get("timestep", 0) < prev_step)
+            )
+            if new_run:
+                runs.append({"run": run_id or p.get("ts"), "started": p.get("ts"), "points": []})
+            runs[-1]["points"].append(p)
+            prev_step = p.get("timestep", 0)
+
+        summary = [{
+            "run":          r["run"],
+            "started":      r["started"],
+            "ended":        r["points"][-1].get("ts"),
+            "steps":        r["points"][-1].get("timestep", 0),
+            "final_reward": r["points"][-1].get("mean_reward"),
+            "first_reward": r["points"][0].get("mean_reward"),
+        } for r in runs]
+        latest = runs[-1]["points"][-limit:] if runs else []
+        return ok({"points": latest, "runs": summary[-50:], "n": len(latest)})
 
     @app.get("/rl/episode", tags=["learning"], dependencies=[Auth])
     def rl_episode(bars: int = 600, deterministic: bool = True):
@@ -735,6 +761,87 @@ def create_app(
         if not info:
             raise HTTPException(503, "MT5 not connected — no account info available.")
         return ok(info)
+
+    # ====================================================================
+    # /account — full MT5 account history (bot + manual trades)
+    # ====================================================================
+
+    _history_cache: dict = {}
+
+    def _account_history():
+        """AccountHistory bound to the current execution engine (it changes
+        when a trader starts and attaches its own engine)."""
+        from config.settings import settings as _cfg
+        from monitoring.account_history import AccountHistory
+
+        engine = _state.execution_engine
+        if engine is None or not engine.get_account_info():
+            raise HTTPException(503, "MT5 not connected — account history unavailable.")
+        if _history_cache.get("engine") is not engine:
+            _history_cache["engine"] = engine
+            _history_cache["history"] = AccountHistory(
+                fetch_deals  = engine.get_history_deals,
+                utc_offset_s = engine.server_utc_offset_s,
+                bot_magic    = _cfg.mt5.magic_number,
+            )
+        return _history_cache["history"]
+
+    def _local_day(value: Optional[str], tz_offset_min: int, end: bool = False):
+        """'YYYY-MM-DD' in the viewer's local time → UTC datetime (end=True
+        gives the start of the following day, so the bound is exclusive)."""
+        if not value:
+            return None
+        try:
+            day = datetime.strptime(value, "%Y-%m-%d")
+        except ValueError as exc:
+            raise HTTPException(422, f"Invalid date {value!r}, expected YYYY-MM-DD") from exc
+        if end:
+            day += timedelta(days=1)
+        return (day - timedelta(minutes=tz_offset_min)).replace(tzinfo=timezone.utc)
+
+    @app.get("/account/summary", tags=["account"], dependencies=[Auth])
+    def account_summary(
+        source:        str = Query("all", pattern="^(all|bot|manual)$"),
+        tz_offset_min: int = Query(0, ge=-840, le=840),
+    ):
+        """Realised P&L since the account opened and for today / this week /
+        month / year (viewer's local calendar), plus deposits and win rate."""
+        return ok(_account_history().summary(source=source, tz_offset_min=tz_offset_min))
+
+    @app.get("/account/pnl", tags=["account"], dependencies=[Auth])
+    def account_pnl(
+        group:         str = Query("day", pattern="^(hour|day|week|month|year)$"),
+        start:         Optional[str] = Query(None, description="YYYY-MM-DD (local)"),
+        end:           Optional[str] = Query(None, description="YYYY-MM-DD (local, inclusive)"),
+        source:        str = Query("all", pattern="^(all|bot|manual)$"),
+        tz_offset_min: int = Query(0, ge=-840, le=840),
+    ):
+        """Net realised P&L per hour / day / week / month / year."""
+        return ok(_account_history().pnl_series(
+            group=group,
+            start=_local_day(start, tz_offset_min),
+            end=_local_day(end, tz_offset_min, end=True),
+            source=source,
+            tz_offset_min=tz_offset_min,
+        ))
+
+    @app.get("/account/history", tags=["account"], dependencies=[Auth])
+    def account_history(
+        start:         Optional[str] = Query(None, description="YYYY-MM-DD (local)"),
+        end:           Optional[str] = Query(None, description="YYYY-MM-DD (local, inclusive)"),
+        source:        str = Query("all", pattern="^(all|bot|manual)$"),
+        symbol:        Optional[str] = Query(None),
+        limit:         int = Query(500, ge=1, le=10000),
+        tz_offset_min: int = Query(0, ge=-840, le=840),
+    ):
+        """Every closed position of the MT5 account, newest first."""
+        rows = _account_history().trades(
+            start=_local_day(start, tz_offset_min),
+            end=_local_day(end, tz_offset_min, end=True),
+            source=source,
+            symbol=symbol,
+        )
+        return ok({"total": len(rows), "trades": rows[:limit]})
 
     @app.get("/portfolio/allocations", tags=["portfolio"], dependencies=[Auth])
     def portfolio_allocations():

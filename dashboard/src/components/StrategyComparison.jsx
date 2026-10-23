@@ -73,9 +73,9 @@ export default function StrategyComparison({ strategies }) {
       {/* Stats table */}
       <div className="strat-table">
         <div className="st-row st-head">
-          <span>STRATEGY</span>
+          <span>STRATÉGIE</span>
           <span className="align-right">TRADES</span>
-          <span className="align-right">WIN %</span>
+          <span className="align-right">GAGNANTS %</span>
           <span className="align-right">SHARPE</span>
         </div>
         {data.map((s, i) => (
@@ -116,13 +116,13 @@ function BarTooltip({ active, payload, label }) {
     <div className="chart-tooltip">
       <div className="ct-time">{d.full}</div>
       <div className="ct-row">
-        <span className="ct-label">Cum. PnL</span>
+        <span className="ct-label">P&L cumulé</span>
         <span className="ct-val" style={{ color: d.pnl >= 0 ? 'var(--green)' : 'var(--red)' }}>
           {d.pnl >= 0 ? '+' : ''}${Math.abs(d.pnl).toFixed(2)}
         </span>
       </div>
       <div className="ct-row">
-        <span className="ct-label">Win Rate</span>
+        <span className="ct-label">Taux de gain</span>
         <span className="ct-val">{d.win.toFixed(1)}%</span>
       </div>
       <div className="ct-row">
@@ -143,5 +143,5 @@ function shortName(name) {
 }
 
 function Empty() {
-  return <div className="empty">No strategy data yet…</div>
+  return <div className="empty">Pas encore de données de stratégie…</div>
 }

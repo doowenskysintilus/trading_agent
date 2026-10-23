@@ -32,7 +32,7 @@ export default function RLEnvReplay() {
       if (!traj.length) {
         setData(null)
         setMeta(null)
-        setMsg(d?.data?.message || 'No episode data.')
+        setMsg(d?.data?.message || 'Aucune donnée d\'épisode.')
         return
       }
       // Mark the bars where the agent OPENS a position. Use the resulting
@@ -53,7 +53,7 @@ export default function RLEnvReplay() {
       setData(chart)
       setMeta(d.data)
     } catch (e) {
-      setError(e.message || 'Replay failed')
+      setError(e.message || 'Rejeu impossible')
     } finally {
       setBusy(false)
     }
@@ -70,7 +70,7 @@ export default function RLEnvReplay() {
     <div className="rle">
       <div className="rle-head">
         <button className="btn btn-accent" onClick={fetchEpisode} disabled={busy}>
-          {busy ? 'Replaying…' : 'Visualise environment'}
+          {busy ? 'Rejeu…' : "Rejouer l'agent sur l'historique récent"}
         </button>
         {meta && (
           <span className="rle-stat">
@@ -172,12 +172,12 @@ export default function RLEnvReplay() {
 function ReplayTooltip({ active, payload }) {
   if (!active || !payload?.length) return null
   const d = payload[0].payload
-  const evt = d.long != null ? 'Open long' : d.short != null ? 'Open short' : '—'
+  const evt = d.long != null ? 'Ouverture achat' : d.short != null ? 'Ouverture vente' : '—'
   return (
     <div className="chart-tooltip">
       <div className="ct-time">bar {d.step} · {evt}</div>
       <div className="ct-row">
-        <span className="ct-label">Price</span>
+        <span className="ct-label">Prix</span>
         <span className="ct-val">{Number(d.price).toFixed(5)}</span>
       </div>
       <div className="ct-row">

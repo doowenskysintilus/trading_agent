@@ -12,7 +12,7 @@ export default function RiskStatus({ risk, portfolio }) {
 
   // Normalise verdict string
   const rawVerdict = (risk?.verdict ?? '').toUpperCase().trim()
-  const verdict    = rawVerdict || (risk ? 'OK' : 'NO DATA')
+  const verdict    = rawVerdict || (risk ? 'OK' : 'PAS DE DONNÉES')
 
   const verdictColor = {
     'OK':      'var(--green)',
@@ -21,7 +21,7 @@ export default function RiskStatus({ risk, portfolio }) {
     'WARNING': 'var(--yellow)',
     'BLOCK':   'var(--red)',
     'FAIL':    'var(--red)',
-    'NO DATA': 'var(--text-dim)',
+    'PAS DE DONNÉES': 'var(--text-dim)',
   }[verdict] ?? 'var(--yellow)'
 
   return (
@@ -36,7 +36,7 @@ export default function RiskStatus({ risk, portfolio }) {
       {/* Gauges */}
       <div className="risk-gauges">
         <Gauge
-          label="Daily P&L"
+          label="P&L du jour"
           value={dailyPct}
           max={10}
           unit="%"
@@ -53,7 +53,7 @@ export default function RiskStatus({ risk, portfolio }) {
           dangerAt={10}
         />
         <Gauge
-          label="Leverage"
+          label="Levier"
           value={leverage}
           max={10}
           unit="×"
@@ -65,9 +65,9 @@ export default function RiskStatus({ risk, portfolio }) {
       {/* Key stats */}
       <div className="risk-stats">
         <RiskStat label="VaR 95%"   value={`$${Math.abs(var95).toFixed(0)}`} />
-        <RiskStat label="Exposure"  value={exposure >= 1000 ? `$${(exposure / 1000).toFixed(1)}K` : `$${exposure.toFixed(0)}`} />
+        <RiskStat label="Exposition"  value={exposure >= 1000 ? `$${(exposure / 1000).toFixed(1)}K` : `$${exposure.toFixed(0)}`} />
         <RiskStat label="Positions" value={nPos} />
-        <RiskStat label="Daily PnL" value={`${dailyPct >= 0 ? '+' : ''}${dailyPct.toFixed(2)}%`}
+        <RiskStat label="P&L du jour" value={`${dailyPct >= 0 ? '+' : ''}${dailyPct.toFixed(2)}%`}
                   color={dailyPct >= 0 ? 'var(--green)' : 'var(--red)'} />
       </div>
 

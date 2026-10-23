@@ -8,6 +8,13 @@ import { AUTH_HEADERS, buildApiPath } from '../apiConfig.js'
 // Manual trigger to retrain the learning models from the system's own trade
 // results: the ML win/loss classifier (always) and, optionally, the RL agent.
 // ---------------------------------------------------------------------------
+const STATE_LABELS = {
+  idle:    'inactif',
+  running: 'en cours',
+  done:    'terminé',
+  error:   'erreur',
+}
+
 export default function RetrainControls() {
   const [status,  setStatus]  = useState(null)
   const [busy,    setBusy]    = useState(false)
@@ -67,13 +74,13 @@ export default function RetrainControls() {
         if (r.status === 409 || raw.toLowerCase().includes('already in progress')) {
           // Sync UI with active run when backend reports a lock.
           await fetchStatus()
-          throw new Error('A retraining run is already active. Click Stop or wait for completion.')
+          throw new Error('Un entraînement est déjà en cours. Cliquez sur Arrêter ou attendez la fin.')
         }
         throw new Error(raw)
       }
       setStatus(d.data)
     } catch (e) {
-      setError(e.message || 'Retrain failed')
+      setError(e.message || 'Échec du réentraînement')
     } finally {
       setBusy(false)
     }
@@ -93,7 +100,7 @@ export default function RetrainControls() {
       }
       setStatus(d.data)
     } catch (e) {
-      setError(e.message || 'Stop failed')
+      setError(e.message || 'Échec de l\'arrêt')
     } finally {
       setBusy(false)
     }
@@ -111,14 +118,14 @@ export default function RetrainControls() {
           onClick={handleRetrain}
           disabled={busy || running}
         >
-          {running ? 'Training…' : 'Retrain models'}
+          {running ? 'Entraînement…' : 'Réentraîner les modèles'}
         </button>
         <button
           className="btn"
           onClick={handleStop}
           disabled={busy || !running}
         >
-          Stop
+          Arrêter
         </button>
         <label className="retrain-check">
           <input
@@ -127,7 +134,7 @@ export default function RetrainControls() {
             onChange={(e) => setTrainRl(e.target.checked)}
             disabled={busy || running}
           />
-          incl. RL agent
+          agent RL inclus
         </label>
         <label className="retrain-check">
           <input
@@ -145,10 +152,10 @@ export default function RetrainControls() {
             onChange={(e) => setUseMaxHistory(e.target.checked)}
             disabled={busy || running || !trainRl}
           />
-          Max bougies (timeframe)
+          Tout l'historique
         </label>
         <label className="retrain-check">
-          history bars
+          bougies d'historique
           <input
             type="number"
             min={200}
@@ -159,7 +166,7 @@ export default function RetrainControls() {
           />
         </label>
         <label className="retrain-check">
-          interval (s)
+          pause entre runs (s)
           <input
             type="number"
             min={60}
@@ -176,17 +183,17 @@ export default function RetrainControls() {
       {status && (
         <div className="retrain-status">
           <span className={`retrain-state retrain-state--${status.state}`}>
-            {status.state}
+            {STATE_LABELS[status.state] ?? status.state}
           </span>
           {status.run_count != null && (
             <span className="retrain-metric">
-              runs: {status.run_count}
+              runs : {status.run_count}
               {status.state === 'running' && status.rl_timesteps_total > 0 && (
                 <>
                   {' · '}
                   {(status.rl_timesteps_done ?? 0).toLocaleString()}
                   {'/'}
-                  {status.rl_timesteps_total.toLocaleString()} steps
+                  {status.rl_timesteps_total.toLocaleString()} étapes
                   {' ('}
                   {Math.round(100 * (status.rl_timesteps_done ?? 0) / status.rl_timesteps_total)}
                   {'%)'}
@@ -198,16 +205,26 @@ export default function RetrainControls() {
             <span className="retrain-metric">
               ML: {ml.trained
                 ? `${ml.n_samples} trades · acc ${(ml.accuracy * 100).toFixed(0)}% · auc ${ml.auc}`
-                : (ml.message || 'not trained')}
+                : (ml.message || 'non entraîné')}
             </span>
           )}
           {ml.warning && (
             <span className="retrain-metric" style={{ color: 'var(--yellow)' }}>
-              ML warning: {ml.warning}
+              Avertissement ML : {ml.warning}
             </span>
           )}
-          {trainRl && rl.message && (
-            <span className="retrain-metric">RL: {rl.message}</span>
+          {status.message && (
+            <span
+              className="retrain-metric"
+              style={/fail|error|erreur|échec/i.test(status.message) ? { color: 'var(--red)' } : undefined}
+            >
+              {status.message}
+            </span>
+          )}
+          {rl.message && rl.trained === false && (
+            <span className="retrain-metric" style={{ color: 'var(--red)' }}>
+              RL : {rl.message}
+            </span>
           )}
         </div>
       )}

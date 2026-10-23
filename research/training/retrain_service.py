@@ -361,6 +361,10 @@ class RetrainService:
             timeframe       = timeframe or "H1",
             total_timesteps = timesteps,
             model_dir       = self.model_dir,
+            # Next to model_dir (data/storage/logs by default) — a service
+            # pointed at a scratch model_dir (tests) must not write into the
+            # live dashboard's reward history.
+            progress_path   = str(Path(self.model_dir).parent / "logs" / "rl_progress.jsonl"),
         )
         # RL-04 — train with the spread actually measured on the broker's
         # history (attached by the feature provider), not a fixed guess.

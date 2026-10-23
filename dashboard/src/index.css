@@ -82,9 +82,15 @@ body {
 .header-metrics {
   display:     flex;
   align-items: center;
-  gap:         24px;
+  gap:         16px;
   flex:        1;
+  /* Never push the controls (Démarrer / Arrêter) off-screen: metrics
+     give way first. */
+  min-width:   0;
+  overflow:    hidden;
 }
+.header-metrics .metric { flex-shrink: 0; }
+.metric-label { white-space: nowrap; }
 
 .metric {
   display:        flex;
@@ -170,6 +176,80 @@ body {
   padding:    0 4px;
 }
 
+/* ── Header tabs ───────────────────────────────────────────────────────── */
+.header-tabs { display: flex; gap: 4px; flex-shrink: 0; }
+.header-tabs button {
+  padding:       5px 12px;
+  background:    transparent;
+  border:        1px solid var(--border);
+  border-radius: var(--radius);
+  color:         var(--text-dim);
+  font-family:   var(--font);
+  font-size:     11px;
+  cursor:        pointer;
+}
+.header-tabs button:hover  { color: var(--text); }
+.header-tabs button.active { color: var(--accent); border-color: var(--accent); background: rgba(0,201,167,0.08); }
+
+/* ── History view ──────────────────────────────────────────────────────── */
+.history-view { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px 24px; }
+.ah { display: flex; flex-direction: column; gap: 12px; max-width: 1400px; margin: 0 auto; }
+.ah-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
+.ah-tile {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 10px 12px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+}
+.ah-tile-label { font-size: 9px; letter-spacing: 1.2px; text-transform: uppercase; color: var(--text-dim); }
+.ah-tile-value { font-size: 18px; font-weight: 700; }
+.ah-tile-sub   { font-size: 10px; color: var(--text-muted); }
+.ah-tile--stats { font-size: 11px; gap: 3px; }
+.ah-filters {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  padding: 8px 12px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  font-size: 11px; color: var(--text-dim);
+}
+.ah-filters label { display: flex; align-items: center; gap: 6px; }
+.ah-filters input, .ah-filters select {
+  background: var(--surface-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 3px 6px; font-family: var(--font); font-size: 11px; color-scheme: dark;
+}
+.ah-quick { display: flex; gap: 4px; flex-wrap: wrap; }
+.ah-chip {
+  padding: 4px 10px;
+  background: var(--surface-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  font-family: var(--font); font-size: 11px; cursor: pointer;
+}
+.ah-chip:hover { border-color: var(--accent); }
+.ah-more { align-self: center; margin-top: 8px; }
+.ah-error { color: var(--red); font-size: 11px; }
+.ah-card {
+  display: flex; flex-direction: column;
+  padding: 10px 12px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+}
+.ah-card-head {
+  display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+  margin-bottom: 8px; font-size: 11px; color: var(--text-dim);
+}
+.ah-card-head > span:first-child { text-transform: uppercase; letter-spacing: 1px; font-size: 10px; }
+.ah-legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 10px; color: var(--text-muted); margin-top: 4px; }
+.ah-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+.ah-empty { padding: 24px; text-align: center; color: var(--text-muted); font-size: 11px; }
+.ah-table-wrap { overflow-x: auto; }
+.ah-table { width: 100%; border-collapse: collapse; font-size: 11px; white-space: nowrap; }
+.ah-table th {
+  text-align: left; font-weight: 500; font-size: 9px; letter-spacing: 1px; text-transform: uppercase;
+  color: var(--text-dim); padding: 6px 8px; border-bottom: 1px solid var(--border);
+}
+.ah-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); }
+.ah-table tbody tr:hover { background: var(--surface-2); }
+.ah .pos { color: var(--green); }
+.ah .neg { color: var(--red); }
+
 /* ── Main grid ─────────────────────────────────────────────────────────── */
 .grid {
   display:               grid;
@@ -196,6 +276,7 @@ body {
 
 .panel-calendar .panel-body {
   padding: 0;
+  overflow-x: auto;
 }
 
 /* ── Panel ─────────────────────────────────────────────────────────────── */
@@ -790,7 +871,34 @@ body {
   font-size: 10px;
   color:     var(--text-muted);
 }
-.rlp-chart { width: 100%; }
+.rlp-chart { width: 100%; min-width: 0; }
+.rlp-grid {
+  display:               grid;
+  grid-template-columns: 2fr 1fr;
+  gap:                   12px;
+}
+@media (max-width: 900px) { .rlp-grid { grid-template-columns: 1fr; } }
+.rlp-subtitle {
+  font-size: 10px;
+  color:     var(--text-dim);
+  margin:    2px 0 2px;
+}
+.rlp-legend {
+  display:   flex;
+  gap:       14px;
+  flex-wrap: wrap;
+  font-size: 10px;
+  color:     var(--text-muted);
+  margin-top: 2px;
+}
+.rlp-legend i {
+  display:        inline-block;
+  width:          10px;
+  height:         3px;
+  margin-right:   5px;
+  vertical-align: middle;
+  border-radius:  2px;
+}
 .rlp-empty {
   margin-top:    10px;
   padding:       10px;
@@ -831,3 +939,12 @@ body {
   line-height: 1.5;
 }
 
+
+/* Short screens: let the live grid scroll instead of crushing every panel
+   (kept last so it overrides the base .grid rows). */
+@media (max-height: 820px) {
+  .grid {
+    overflow-y:         auto;
+    grid-template-rows: 320px 300px 260px 260px;
+  }
+}

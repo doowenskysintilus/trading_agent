@@ -32,7 +32,7 @@ export default function AccountSwitcher() {
 
   const activePort = getActivePort()
   const active = accounts.find((a) => String(a.port) === String(activePort))
-  const activeLabel = active ? active.label : (activePort ? `Port ${activePort}` : 'Default (.env)')
+  const activeLabel = active ? active.label : (activePort ? `Port ${activePort}` : 'Compte par défaut (.env)')
 
   const switchTo = useCallback((port) => {
     setActivePort(port)
@@ -58,22 +58,22 @@ export default function AccountSwitcher() {
 
   return (
     <div className="tc" style={{ position: 'relative' }}>
-      <button className="tc-btn" onClick={() => setOpen((v) => !v)} title="Switch MT5 account">
+      <button className="tc-btn" onClick={() => setOpen((v) => !v)} title="Changer de compte MT5">
         ◇ {activeLabel}
       </button>
 
       {open && (
         <div className="tc-popover">
           <div className="tc-popover-head">
-            <span>Accounts</span>
+            <span>Comptes</span>
             <button className="tc-x" onClick={() => setOpen(false)}>✕</button>
           </div>
 
           <div className="tc-field">
-            <label>Saved accounts (one API instance per port)</label>
+            <label>Comptes enregistrés (une instance d'API par port)</label>
             {accounts.length === 0 && (
-              <p className="tc-hint">No saved accounts yet — add one below. Ports come from
-                accounts.json / run_all_accounts.py on the backend.</p>
+              <p className="tc-hint">Aucun compte enregistré — ajoutez-en un ci-dessous. Les ports viennent de
+                accounts.json / run_all_accounts.py côté serveur.</p>
             )}
             {accounts.map((a) => (
               <div key={a.port} className="tc-row" style={{ alignItems: 'center', marginBottom: 6 }}>
@@ -89,16 +89,16 @@ export default function AccountSwitcher() {
             ))}
             {activePort && (
               <button className="tc-chip" onClick={() => switchTo('')}>
-                Use default (.env / build) port
+                Utiliser le port par défaut (.env)
               </button>
             )}
           </div>
 
           <div className="tc-field">
-            <label>Add account</label>
+            <label>Ajouter un compte</label>
             <div className="tc-row">
               <input
-                type="text" placeholder="Label (e.g. FTMO 10k #1)"
+                type="text" placeholder="Nom (ex. FTMO 10k #1)"
                 value={newLabel} onChange={(e) => setNewLabel(e.target.value)}
               />
               <input
@@ -106,13 +106,13 @@ export default function AccountSwitcher() {
                 value={newPort} onChange={(e) => setNewPort(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && addAccount()}
               />
-              <button className="tc-btn" onClick={addAccount}>+ Add</button>
+              <button className="tc-btn" onClick={addAccount}>+ Ajouter</button>
             </div>
           </div>
 
           <p className="tc-hint">
-            Switching reloads the page and points every REST/WebSocket call at the
-            selected port — one account's full view at a time, not merged.
+            Changer de compte recharge la page et dirige toutes les requêtes vers le
+            port choisi — un compte à la fois, sans fusion des données.
           </p>
         </div>
       )}

@@ -11,13 +11,13 @@ export default function TradesFeed({ trades }) {
   return (
     <div className="trades-feed">
       <div className="tf-head tf-row">
-        <span>TIME</span>
-        <span>SYMBOL</span>
-        <span>DIR</span>
-        <span>SIZE</span>
-        <span>EXIT</span>
+        <span>HEURE</span>
+        <span>SYMBOLE</span>
+        <span>SENS</span>
+        <span>TAILLE</span>
+        <span>SORTIE</span>
         <span className="align-right">P&L</span>
-        <span>STRATEGY</span>
+        <span>STRATÉGIE</span>
       </div>
       {trades.map((t, i) => (
         <TradeRow key={`${t.ts ?? i}|${t.symbol ?? i}|${i}`} trade={t} isNew={i === 0} />

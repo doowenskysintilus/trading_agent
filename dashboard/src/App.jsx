@@ -8,6 +8,7 @@ import EconomicCalendar   from './components/EconomicCalendar.jsx'
 import TradingControls    from './components/TradingControls.jsx'
 import RetrainControls    from './components/RetrainControls.jsx'
 import AccountSwitcher    from './components/AccountSwitcher.jsx'
+import AccountHistory     from './components/AccountHistory.jsx'
 import useWebSocket       from './hooks/useWebSocket.js'
 import { AUTH_HEADERS, WS_URL, buildApiPath } from './apiConfig.js'
 
@@ -26,6 +27,7 @@ export default function App() {
   const [account,    setAccount]    = useState(null)        // real MT5 account { balance, equity, currency … }
   const [running,    setRunning]    = useState(false)       // trading loop active
   const [emergency,  setEmergency]  = useState(false)       // emergency stop engaged
+  const [view,       setView]       = useState('live')      // 'live' | 'history'
 
   const { lastMessage, status } = useWebSocket(WS_URL)
 
@@ -177,6 +179,23 @@ export default function App() {
     }
   }, [status, setPositionsSafe])
 
+  // ---- MT5 account figures even when the bot is stopped ---------------
+  // The WebSocket only carries the account while a trader runs; without
+  // this the header showed 0.00 equity/balance whenever the bot was off.
+  useEffect(() => {
+    let active = true
+    const refreshAccount = async () => {
+      try {
+        const r = await fetch(buildApiPath('/api/portfolio/account'), { headers: AUTH_HEADERS })
+        const d = await r.json()
+        if (active && r.ok && d?.data) setAccount(d.data)
+      } catch { /* keep last known figures */ }
+    }
+    refreshAccount()
+    const timer = setInterval(refreshAccount, 10000)
+    return () => { active = false; clearInterval(timer) }
+  }, [])
+
   // ---- Derived values -------------------------------------------------
   // Prefer the REAL MT5 account figures when connected; otherwise fall back
   // to the internal monitor's portfolio tracking.
@@ -199,19 +218,28 @@ export default function App() {
           <span className="brand-name">QUANT FUND</span>
         </div>
 
+        <nav className="header-tabs">
+          <button className={view === 'live' ? 'active' : ''} onClick={() => setView('live')}>
+            Trading en direct
+          </button>
+          <button className={view === 'history' ? 'active' : ''} onClick={() => setView('history')}>
+            Historique &amp; performance
+          </button>
+        </nav>
+
         <div className="header-metrics">
           <Metric label={`EQUITY (${ccy})`}  value={fmt(equity_val)} />
-          <Metric label={`BALANCE (${ccy})`} value={fmt(balance)} />
+          <Metric label={`SOLDE (${ccy})`} value={fmt(balance)} />
           {free_margin != null && (
-            <Metric label={`FREE MARGIN (${ccy})`} value={fmt(free_margin)} />
+            <Metric label={`MARGE LIBRE (${ccy})`} value={fmt(free_margin)} />
           )}
           <Metric
-            label="DAY P&L"
+            label="P&L DU JOUR"
             value={`${daily_pnl >= 0 ? '+' : ''}$${fmt(Math.abs(daily_pnl))}`}
             color={daily_pnl >= 0 ? 'var(--green)' : 'var(--red)'}
           />
           <Metric
-            label="DAY %"
+            label="JOUR %"
             value={`${daily_pct >= 0 ? '+' : ''}${daily_pct.toFixed(2)}%`}
             color={daily_pct >= 0 ? 'var(--green)' : 'var(--red)'}
           />
@@ -229,7 +257,7 @@ export default function App() {
           <WsStatusBadge status={status} />
           {alerts.length > 0 && (
             <button className="alert-badge" onClick={() => setAlerts([])}>
-              ⚠ {alerts.length} ALERT{alerts.length > 1 ? 'S' : ''}
+              ⚠ {alerts.length} ALERTE{alerts.length > 1 ? 'S' : ''}
             </button>
           )}
         </div>
@@ -239,30 +267,36 @@ export default function App() {
       {alerts.length > 0 && (
         <div className="alert-banner">
           <span className="alert-icon">⚠</span>
-          <span className="alert-text">{alerts[0].message ?? alerts[0].type ?? 'Alert'}</span>
+          <span className="alert-text">{alerts[0].message ?? alerts[0].type ?? 'Alerte'}</span>
           <button className="alert-close" onClick={() => setAlerts([])}>✕</button>
         </div>
       )}
 
+      {view === 'history' && (
+        <main className="history-view">
+          <AccountHistory />
+        </main>
+      )}
+
       {/* ── Main grid ───────────────────────────────────────────────── */}
-      <main className="grid">
+      {view === 'live' && <main className="grid">
 
         <section className="panel panel-chart">
-          <PanelHeader title="Portfolio Equity Curve" />
+          <PanelHeader title="Courbe d'equity du portefeuille" />
           <div className="panel-body">
             <PnLChart data={equity} />
           </div>
         </section>
 
         <section className="panel panel-risk">
-          <PanelHeader title="Risk Status" />
+          <PanelHeader title="État du risque" />
           <div className="panel-body">
             <RiskStatus risk={risk} portfolio={portfolio} />
           </div>
         </section>
 
         <section className="panel panel-strategy">
-          <PanelHeader title="Strategy Performance" />
+          <PanelHeader title="Performance des stratégies et entraînement" />
           <div className="panel-body">
             <RetrainControls />
             <StrategyComparison strategies={strategies} />
@@ -270,27 +304,27 @@ export default function App() {
         </section>
 
         <section className="panel panel-calendar">
-          <PanelHeader title="Economic Calendar" />
+          <PanelHeader title="Calendrier économique" />
           <div className="panel-body panel-body--scroll">
             <EconomicCalendar />
           </div>
         </section>
 
         <section className="panel panel-positions">
-          <PanelHeader title={`Open Positions (${n_positions})`} />
+          <PanelHeader title={`Positions ouvertes (${n_positions})`} />
           <div className="panel-body panel-body--scroll">
             <PositionsTable positions={positions} />
           </div>
         </section>
 
         <section className="panel panel-trades">
-          <PanelHeader title="Live Trades Feed" badge={trades.length} />
+          <PanelHeader title="Trades fermés en direct" badge={trades.length} />
           <div className="panel-body panel-body--scroll">
             <TradesFeed trades={trades} />
           </div>
         </section>
 
-      </main>
+      </main>}
     </div>
   )
 }
@@ -319,6 +353,13 @@ function PanelHeader({ title, badge }) {
   )
 }
 
+const WS_LABEL = {
+  connected:    'connecté',
+  connecting:   'connexion…',
+  reconnecting: 'reconnexion…',
+  disconnected: 'déconnecté',
+}
+
 const STATUS_COLOR = {
   connected:    'var(--green)',
   connecting:   'var(--yellow)',
@@ -330,7 +371,7 @@ function WsStatusBadge({ status }) {
   return (
     <div className="ws-badge">
       <span className="ws-dot" style={{ background: STATUS_COLOR[status] ?? 'var(--yellow)' }} />
-      <span className="ws-label">{status.toUpperCase()}</span>
+      <span className="ws-label">{(WS_LABEL[status] ?? status).toUpperCase()}</span>
     </div>
   )
 }

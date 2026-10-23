@@ -58,7 +58,7 @@ export default function EconomicCalendar() {
             <span>Pays</span>
             <span>Événement</span>
             <span>Impact</span>
-            <span>Forecast</span>
+            <span>Prévision</span>
             <span>Préc.</span>
             <span>Réel</span>
           </div>

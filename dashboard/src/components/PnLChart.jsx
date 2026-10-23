@@ -105,7 +105,7 @@ function CustomTooltip({ active, payload, startEquity }) {
         <span className="ct-val">${d.equity?.toLocaleString()}</span>
       </div>
       <div className="ct-row">
-        <span className="ct-label">Change</span>
+        <span className="ct-label">Variation</span>
         <span className="ct-val" style={{ color: change >= 0 ? 'var(--green)' : 'var(--red)' }}>
           {change >= 0 ? '+' : ''}${Math.abs(change).toFixed(2)} ({chPct.toFixed(2)}%)
         </span>
@@ -157,5 +157,5 @@ function fmtTimeFull(ts) {
 }
 
 function Empty() {
-  return <div className="empty">Waiting for equity data…</div>
+  return <div className="empty">En attente des données d'equity…</div>
 }

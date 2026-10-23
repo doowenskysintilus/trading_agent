@@ -15,10 +15,10 @@ const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1']
 const HTF_TIMEFRAMES = ['', 'M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1']
 
 const ALLOCATION_METHODS = [
-  { value: 'RISK_PARITY',          label: 'Risk Parity' },
-  { value: 'EQUAL_WEIGHT',         label: 'Equal Weight' },
-  { value: 'PERFORMANCE_WEIGHTED', label: 'Performance Weighted' },
-  { value: 'KELLY',                label: 'Kelly Criterion' },
+  { value: 'RISK_PARITY',          label: 'Parité des risques' },
+  { value: 'EQUAL_WEIGHT',         label: 'Poids égaux' },
+  { value: 'PERFORMANCE_WEIGHTED', label: 'Pondéré par la performance' },
+  { value: 'KELLY',                label: 'Critère de Kelly' },
 ]
 
 // ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ export default function TradingControls({ running, emergency }) {
       }
       return data
     } catch (e) {
-      setError(e.message || 'Request failed')
+      setError(e.message || 'Requête impossible')
       throw e
     } finally {
       setBusy(false)
@@ -114,7 +114,7 @@ export default function TradingControls({ running, emergency }) {
 
   const handleStart = useCallback(async () => {
     if (!symbols.length) {
-      setError('Select at least one pair.')
+      setError('Choisissez au moins une paire.')
       return
     }
     // Guard against empty / invalid numeric fields, which would otherwise be
@@ -171,17 +171,17 @@ export default function TradingControls({ running, emergency }) {
           }}
         />
         <span className="tc-label">
-          {emergency ? 'EMERGENCY' : running ? 'TRADING' : 'IDLE'}
+          {emergency ? 'URGENCE' : running ? 'EN TRADING' : 'ARRÊTÉ'}
         </span>
       </div>
 
       {running ? (
         <>
           <button className="tc-btn tc-btn--stop" disabled={busy} onClick={handleStop}>
-            ■ STOP
+            ■ ARRÊTER
           </button>
           <button className="tc-btn tc-btn--emergency" disabled={busy} onClick={handleEmergency}>
-            ⚠ KILL
+            ⚠ ARRÊT D'URGENCE
           </button>
         </>
       ) : (
@@ -190,7 +190,7 @@ export default function TradingControls({ running, emergency }) {
           disabled={busy || emergency}
           onClick={() => setOpen((v) => !v)}
         >
-          ▶ START
+          ▶ DÉMARRER
         </button>
       )}
 
@@ -198,12 +198,12 @@ export default function TradingControls({ running, emergency }) {
       {open && !running && (
         <div className="tc-popover">
           <div className="tc-popover-head">
-            <span>Start Trading</span>
+            <span>Démarrer le trading</span>
             <button className="tc-x" onClick={() => setOpen(false)}>✕</button>
           </div>
 
           <div className="tc-field">
-            <label>Pairs</label>
+            <label>Paires</label>
             <div className="tc-chips">
               {PRESET_SYMBOLS.map((sym) => (
                 <button
@@ -218,12 +218,12 @@ export default function TradingControls({ running, emergency }) {
             <div className="tc-custom">
               <input
                 type="text"
-                placeholder="Custom symbol (e.g. EURGBP)"
+                placeholder="Autre symbole (ex. EURGBP)"
                 value={custom}
                 onChange={(e) => setCustom(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && addCustom()}
               />
-              <button onClick={addCustom}>+ Add</button>
+              <button onClick={addCustom}>+ Ajouter</button>
             </div>
             {symbols.length > 0 && (
               <div className="tc-selected">
@@ -238,7 +238,7 @@ export default function TradingControls({ running, emergency }) {
 
           <div className="tc-row">
             <div className="tc-field">
-              <label>Timeframe</label>
+              <label>Unité de temps</label>
               <select value={timeframe} onChange={(e) => setTimeframe(e.target.value)}>
                 {TIMEFRAMES.map((tf) => <option key={tf} value={tf}>{tf}</option>)}
               </select>
@@ -254,7 +254,7 @@ export default function TradingControls({ running, emergency }) {
               />
             </div>
             <div className="tc-field">
-              <label>Bars (candles)</label>
+              <label>Bougies chargées</label>
               <input
                 type="number"
                 min={50}
@@ -270,14 +270,14 @@ export default function TradingControls({ running, emergency }) {
                   onChange={(e) => setUseMaxBars(e.target.checked)}
                   style={{ marginRight: 6, verticalAlign: 'middle' }}
                 />
-                Max available (timeframe)
+                Maximum disponible
               </label>
             </div>
           </div>
 
           <div className="tc-row">
             <div className="tc-field">
-              <label>Initial Balance</label>
+              <label>Solde initial</label>
               <input
                 type="number"
                 min={1}
@@ -304,11 +304,11 @@ export default function TradingControls({ running, emergency }) {
                   onChange={(e) => setHtfEnabled(e.target.checked)}
                   style={{ marginRight: 6, verticalAlign: 'middle' }}
                 />
-                Multi-timeframe filter
+                Filtre de tendance (UT supérieure)
               </label>
             </div>
             <div className="tc-field">
-              <label>Trend timeframe</label>
+              <label>UT de la tendance</label>
               <select
                 value={htfTimeframe}
                 disabled={!htfEnabled}
@@ -330,11 +330,11 @@ export default function TradingControls({ running, emergency }) {
                   onChange={(e) => setMlEnabled(e.target.checked)}
                   style={{ marginRight: 6, verticalAlign: 'middle' }}
                 />
-                ML win filter
+                Filtre ML de probabilité de gain
               </label>
             </div>
             <div className="tc-field">
-              <label>Min win prob.</label>
+              <label>Probabilité min. de gain</label>
               <input
                 type="number"
                 step="0.05"
@@ -349,7 +349,7 @@ export default function TradingControls({ running, emergency }) {
 
           <div className="tc-row">
             <div className="tc-field">
-              <label>SL ATR multiplier</label>
+              <label>SL (× ATR)</label>
               <input
                 type="number"
                 min={1}
@@ -360,7 +360,7 @@ export default function TradingControls({ running, emergency }) {
               />
             </div>
             <div className="tc-field">
-              <label>TP ATR multiplier</label>
+              <label>TP (× ATR)</label>
               <input
                 type="number"
                 min={1}
@@ -381,15 +381,15 @@ export default function TradingControls({ running, emergency }) {
                   onChange={(e) => setFtmoEnabled(e.target.checked)}
                   style={{ marginRight: 6, verticalAlign: 'middle' }}
                 />
-                FTMO compliance mode
+                Mode conformité FTMO
               </label>
             </div>
           </div>
           {ftmoEnabled && (
             <p className="tc-hint">
-              Enforces FTMO's actual limits (daily loss 5%, drawdown 10%, soft-stopped
-              earlier) against the Initial Balance above as the fixed challenge
-              reference — stricter than the generic risk limits otherwise used.
+              Applique les vraies limites FTMO (perte journalière 5 %, drawdown 10 %,
+              avec un arrêt un peu avant) calculées sur le solde initial ci-dessus,
+              plus strictes que les limites de risque génériques.
             </p>
           )}
 
@@ -402,28 +402,28 @@ export default function TradingControls({ running, emergency }) {
                   onChange={(e) => setScalpEnabled(e.target.checked)}
                   style={{ marginRight: 6, verticalAlign: 'middle' }}
                 />
-                Scalping rules (SCALPING_RULES.md)
+                Règles de scalping (SCALPING_RULES.md)
               </label>
             </div>
           </div>
           {scalpEnabled && (
             <p className="tc-hint">
-              Every entry and exit goes through the scalping rule engine: sessions,
-              spread, cooldowns, ML filter, time stop, breakeven and ATR trailing.
-              Its values (SL 1.2 / TP 1.5 ATR, 0.25 % risk, min confidence 0.55…)
-              replace the SL/TP, ML and cycle fields above. Configure them with the
-              SCALP_* variables in .env.
+              Chaque entrée et sortie passe par le moteur de règles de scalping : sessions,
+              spread, pauses, filtre ML, durée max, breakeven et trailing ATR.
+              Ses valeurs (SL 1,2 / TP 1,5 ATR, risque 0,25 %, confiance min. 0,55…)
+              remplacent les champs SL/TP, ML et cycle ci-dessus. Elles se règlent
+              avec les variables SCALP_* du fichier .env.
             </p>
           )}
 
           {error && <div className="tc-error">{error}</div>}
 
           <button className="tc-btn tc-btn--start tc-btn--full" disabled={busy} onClick={handleStart}>
-            {busy ? 'Starting…' : '▶ Start Autonomous Trading'}
+            {busy ? 'Démarrage…' : '▶ Démarrer le trading autonome'}
           </button>
           <p className="tc-hint">
-            The system will place and manage all orders automatically
-            (entries, stop-loss, take-profit, trailing stops).
+            Le système passera et gérera tous les ordres automatiquement
+            (entrées, stop-loss, take-profit, stops suiveurs).
           </p>
         </div>
       )}

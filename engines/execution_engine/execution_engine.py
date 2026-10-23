@@ -33,6 +33,7 @@ import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
+from datetime import datetime
 from typing import Optional
 
 # MT5 is an optional runtime dependency
@@ -617,6 +618,32 @@ class MT5ExecutionEngine:
             "server":   getattr(info, "server", ""),
             "login":    getattr(info, "login", 0),
         }
+
+    def get_history_deals(self, date_from: datetime, date_to: datetime) -> list[dict]:
+        """Every deal of the account between two dates (MT5 deal history).
+
+        Times are the broker's clock as returned by MT5 (see
+        server_utc_offset_s to convert to UTC).
+        """
+        if not self._connected or not _MT5_AVAILABLE:
+            return []
+        deals = mt5.history_deals_get(date_from, date_to)
+        if deals is None:
+            return []
+        return [d._asdict() for d in deals]
+
+    def server_utc_offset_s(self, symbol: str = "EURUSD") -> int:
+        """Broker clock minus UTC, in seconds, rounded to the half hour
+        (FTMO runs on UTC+2 / UTC+3). 0 when no fresh quote is available."""
+        if not self._connected or not _MT5_AVAILABLE:
+            return 0
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None or not tick.time:
+            return 0
+        raw = int(tick.time) - int(time.time())
+        if abs(raw) > 15 * 3600:          # stale quote (market closed long ago)
+            return 0
+        return int(round(raw / 1800.0)) * 1800
 
     def get_closed_pnl(self, position_ticket: int) -> Optional[dict]:
         """Realized result of a closed position from MT5 deal history.

@@ -26,7 +26,9 @@
 
 .calendar-row {
   display: grid;
-  grid-template-columns: 120px 44px minmax(0, 1.4fr) 60px 72px 72px 72px;
+  grid-template-columns: 120px 44px minmax(140px, 1.4fr) 60px 72px 72px 72px;
+  /* The panel is ~280px wide: scroll sideways instead of overlapping columns. */
+  min-width: 620px;
   align-items: center;
   padding: 8px 10px;
   background: var(--surface-2);

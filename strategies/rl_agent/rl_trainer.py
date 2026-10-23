@@ -607,6 +607,32 @@ class RewardTrackingCallback(BaseCallback if _SB3_AVAILABLE else object):
         self._progress_callback = progress_callback   # callable(timesteps_done)
         if self._progress_path is not None:
             self._progress_path.parent.mkdir(parents=True, exist_ok=True)
+        # One id per training run: every run restarts at timestep 0, so the
+        # dashboard needs it to plot runs separately instead of overlapping.
+        from datetime import datetime, timezone
+        self._run_id = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        # Steps are reported relative to this run: a warm-started model keeps
+        # its cumulative num_timesteps (the dashboard showed "369 %").
+        self._start_steps = 0
+        self._last_report = 0
+        # Episodes span the whole history (~100k bars on M1), so a run can end
+        # without a single finished episode. Progress is therefore also
+        # sampled once per PPO rollout.
+        self._rollout_reward = 0.0
+        self._rollout_rewards: list[float] = []
+
+    def _steps_done(self) -> int:
+        return int(getattr(self, "num_timesteps", 0)) - self._start_steps
+
+    def _on_training_start(self) -> None:
+        self._start_steps = int(getattr(self, "num_timesteps", 0))
+        self._last_report = 0
+
+    def _on_rollout_end(self) -> None:
+        self._rollout_rewards.append(self._rollout_reward)
+        mean_recent = float(np.mean(self._rollout_rewards[-10:]))
+        self._write_progress(self._rollout_reward, mean_recent)
+        self._rollout_reward = 0.0
 
     def _write_progress(self, last_reward: float, mean_reward: float) -> None:
         if self._progress_path is None:
@@ -614,8 +640,9 @@ class RewardTrackingCallback(BaseCallback if _SB3_AVAILABLE else object):
         import json
         from datetime import datetime, timezone
         record = {
+            "run":         self._run_id,
             "ts":          datetime.now(timezone.utc).isoformat(),
-            "timestep":    int(getattr(self, "num_timesteps", 0)),
+            "timestep":    self._steps_done(),
             "episode":     len(self.episode_rewards),
             "last_reward": round(float(last_reward), 6),
             "mean_reward": round(float(mean_reward), 6),
@@ -627,21 +654,23 @@ class RewardTrackingCallback(BaseCallback if _SB3_AVAILABLE else object):
             logger.debug("RL progress write failed: %s", exc)
 
     def _on_step(self) -> bool:
-        self._ep_reward += float(self.locals["rewards"][0])
+        reward = float(self.locals["rewards"][0])
+        self._ep_reward += reward
+        self._rollout_reward += reward
+        steps = self._steps_done()
+        # External progress callback every 1 000 steps of this run.
+        if self._progress_callback is not None and steps - self._last_report >= 1000:
+            self._last_report = steps
+            try:
+                self._progress_callback(steps)
+            except Exception:
+                pass
         if self.locals["dones"][0]:
             ep_num   = len(self.episode_rewards) + 1
             last_r   = self._ep_reward
             self.episode_rewards.append(last_r)
             recent       = self.episode_rewards[-10:]
             mean_recent  = float(np.mean(recent))
-            steps        = int(getattr(self, "num_timesteps", 0))
-            self._write_progress(last_r, mean_recent)
-            # Fire external progress callback every completed episode.
-            if self._progress_callback is not None:
-                try:
-                    self._progress_callback(steps)
-                except Exception:
-                    pass
             # Print a live progress line every 5 episodes so the operator
             # can see reward trending upward (or flag a problem) in real time.
             if ep_num % 5 == 0:
