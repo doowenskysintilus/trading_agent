@@ -632,18 +632,28 @@ class MT5ExecutionEngine:
             return []
         return [d._asdict() for d in deals]
 
-    def server_utc_offset_s(self, symbol: str = "EURUSD") -> int:
+    def server_utc_offset_s(self, symbols: tuple[str, ...] = ("BTCUSD", "ETHUSD", "EURUSD")) -> int:
         """Broker clock minus UTC, in seconds, rounded to the half hour
-        (FTMO runs on UTC+2 / UTC+3). 0 when no fresh quote is available."""
+        (FTMO runs on UTC+2 / UTC+3).
+
+        tick.time - now = offset - staleness, so the freshest quote (the
+        largest difference) gives the best estimate. Crypto quotes 24/7:
+        with FX alone, a weekend left the last EURUSD tick hours old and the
+        offset came out as 0 (history shifted by 3 h). The last value is
+        kept when no quote is available.
+        """
         if not self._connected or not _MT5_AVAILABLE:
-            return 0
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None or not tick.time:
-            return 0
-        raw = int(tick.time) - int(time.time())
-        if abs(raw) > 15 * 3600:          # stale quote (market closed long ago)
-            return 0
-        return int(round(raw / 1800.0)) * 1800
+            return getattr(self, "_utc_offset_s", 0)
+        now = int(time.time())
+        raws = []
+        for symbol in symbols:
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is not None and tick.time:
+                raws.append(int(tick.time) - now)
+        plausible = [r for r in raws if -15 * 3600 <= r <= 15 * 3600]
+        if plausible:
+            self._utc_offset_s = int(round(max(plausible) / 1800.0)) * 1800
+        return getattr(self, "_utc_offset_s", 0)
 
     def get_closed_pnl(self, position_ticket: int) -> Optional[dict]:
         """Realized result of a closed position from MT5 deal history.
