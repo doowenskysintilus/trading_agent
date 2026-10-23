@@ -335,6 +335,8 @@ class SignalAggregator:
 
         buy_score  = 0.0
         sell_score = 0.0
+        buy_weight  = 0.0   # sum of eff_weight for counted BUY votes
+        sell_weight = 0.0   # sum of eff_weight for counted SELL votes
         buy_votes  = 0
         sell_votes = 0
         votes: list[dict] = []
@@ -360,18 +362,23 @@ class SignalAggregator:
             weighted = sig.confidence * w
 
             if sig.signal == SignalType.BUY:
-                buy_score += weighted
-                buy_votes += 1
+                buy_score  += weighted
+                buy_weight += w
+                buy_votes  += 1
                 vote_entry["counted"] = True
             elif sig.signal == SignalType.SELL:
-                sell_score += weighted
-                sell_votes += 1
+                sell_score  += weighted
+                sell_weight += w
+                sell_votes  += 1
                 vote_entry["counted"] = True
             # HOLD: counted=False, contributes nothing
 
             votes.append(vote_entry)
 
-        return self._decide(buy_score, sell_score, buy_votes, sell_votes, votes)
+        return self._decide(
+            buy_score, sell_score, buy_weight, sell_weight,
+            buy_votes, sell_votes, votes,
+        )
 
     # ------------------------------------------------------------------
     # Decision logic
@@ -381,6 +388,8 @@ class SignalAggregator:
         self,
         buy_score: float,
         sell_score: float,
+        buy_weight: float,
+        sell_weight: float,
         buy_votes: int,
         sell_votes: int,
         votes: list[dict],
@@ -407,11 +416,11 @@ class SignalAggregator:
         if not conflict:
             if buy_votes >= self.min_votes and buy_score > 0:
                 signal     = SignalType.BUY
-                confidence = self._confidence(buy_score, sell_score)
+                confidence = self._confidence(buy_score, buy_weight, sell_score, sell_weight, conflict=False)
                 resolution = "consensus_buy"
             elif sell_votes >= self.min_votes and sell_score > 0:
                 signal     = SignalType.SELL
-                confidence = self._confidence(sell_score, buy_score)
+                confidence = self._confidence(sell_score, sell_weight, buy_score, buy_weight, conflict=False)
                 resolution = "consensus_sell"
             else:
                 signal, confidence = SignalType.HOLD, 0.0
@@ -422,9 +431,9 @@ class SignalAggregator:
             if signal == SignalType.HOLD:
                 confidence = 0.0
             elif signal == SignalType.BUY:
-                confidence = self._confidence(buy_score, sell_score)
+                confidence = self._confidence(buy_score, buy_weight, sell_score, sell_weight, conflict=True)
             else:
-                confidence = self._confidence(sell_score, buy_score)
+                confidence = self._confidence(sell_score, sell_weight, buy_score, buy_weight, conflict=True)
 
         return AggregatedDecision(
             signal=signal,
@@ -447,15 +456,39 @@ class SignalAggregator:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _confidence(winner_score: float, loser_score: float) -> float:
+    def _confidence(
+        winner_score: float,
+        winner_weight: float,
+        loser_score: float,
+        loser_weight: float,
+        conflict: bool,
+    ) -> float:
         """
-        Confidence = margin / total, capped at 1.0.
-        Pure consensus (loser = 0) gives confidence = winner normalised.
+        Confidence = conviction x dominance.
+
+        conviction — weighted-average confidence of the winning side's own
+        votes (winner_score / winner_weight). Reflects how sure the voting
+        strategies actually are.
+
+        dominance — margin / total, only applied when both sides voted
+        (a real conflict). Pure consensus (nobody on the other side) has
+        nothing to dominate over, so dominance = 1.0 and confidence is
+        just the voters' own conviction — NOT automatically 1.0 the way
+        the old margin-only formula produced (winner - 0) / winner = 1.0
+        regardless of how weak the underlying signal actually was.
         """
+        if winner_weight < 1e-10:
+            return 0.0
+        conviction = float(np.clip(winner_score / winner_weight, 0.0, 1.0))
+
+        if not conflict:
+            return conviction
+
         total = winner_score + loser_score
         if total < 1e-10:
-            return 0.0
-        return float(np.clip((winner_score - loser_score) / total, 0.0, 1.0))
+            return conviction
+        dominance = float(np.clip((winner_score - loser_score) / total, 0.0, 1.0))
+        return float(np.clip(conviction * dominance, 0.0, 1.0))
 
     def _empty_decision(self, reason: str) -> AggregatedDecision:
         return AggregatedDecision(
@@ -466,14 +499,6 @@ class SignalAggregator:
             net_score=0.0,
             conflict_resolution=reason,
         )
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
-
-    def performance_summary(self) -> dict[str, dict]:
-        """Current performance stats and effective weights per strategy."""
-        return self._weighter.summary()
 
     def __repr__(self) -> str:
         return (

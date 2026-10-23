@@ -207,6 +207,24 @@ class TradingSettings:
     calendar_api_key: str = field(
         default_factory=lambda: _get_str("TRADING_CALENDAR_API_KEY", "")
     )
+    fred_api_key: str = field(
+        default_factory=lambda: _get_str("TRADING_FRED_API_KEY", "")
+    )
+
+
+@dataclass(frozen=True)
+class AlertSettings:
+    """Real-time alert delivery (drawdown / daily loss / emergency stop)."""
+    telegram_bot_token: str = field(
+        default_factory=lambda: _get_str("TELEGRAM_BOT_TOKEN", "")
+    )
+    telegram_chat_id: str = field(
+        default_factory=lambda: _get_str("TELEGRAM_CHAT_ID", "")
+    )
+
+    @property
+    def telegram_enabled(self) -> bool:
+        return bool(self.telegram_bot_token and self.telegram_chat_id)
 
 
 @dataclass(frozen=True)
@@ -265,6 +283,7 @@ class Settings:
     mysql: MySQLSettings = field(default_factory=MySQLSettings)
     dashboard: DashboardSettings = field(default_factory=DashboardSettings)
     risk_engine: RiskEngineSettings = field(default_factory=RiskEngineSettings)
+    alerts: AlertSettings = field(default_factory=AlertSettings)
 
     env_file: str = field(default_factory=lambda: str(ENV_PATH))
     env_file_loaded: bool = field(default_factory=lambda: _DOTENV_OK and ENV_PATH.exists())

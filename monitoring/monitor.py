@@ -24,15 +24,16 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Callable, Optional
 
 import numpy as np
 
 from monitoring.metrics_store import MetricsStore, MySQLConfig
 from live_trading.live_trader import CycleStatus, TradingCycleResult
+from engines.execution_engine.execution_engine import ExecutionStatus
 
 # ---------------------------------------------------------------------------
 # WebSocket broadcaster — wired by api.main.create_app()
@@ -279,6 +280,23 @@ class TradingMonitor:
                 symbol, strategy, direction, pnl,
             )
 
+            outcome  = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
+            invested = self._position_notional(symbol, size, entry_price)
+            self._fire_alert("TRADE_CLOSED", {
+                "symbol":         symbol,
+                "strategy":       strategy,
+                "direction":      direction,
+                "size":           round(size, 4),
+                "entry_price":    round(entry_price, 5),
+                "exit_price":     round(exit_price, 5),
+                "invested_value": round(invested, 2) if invested is not None else None,
+                "pnl":            round(pnl, 2),
+                "outcome":        outcome,
+                "duration_s":     duration_s,
+                "exit_reason":    exit_reason,
+                "ts":             ts.isoformat(),
+            })
+
     # ------------------------------------------------------------------
     # Core cycle processing
     # ------------------------------------------------------------------
@@ -489,13 +507,58 @@ class TradingMonitor:
             }))
 
         for alert_type, data in alerts:
-            logger.warning("ALERT [%s]: %s", alert_type, data)
-            _broadcast("alert", {"type": alert_type, "message": f"{alert_type}: {data}", **data})
-            for hook in self._alert_hooks:
-                try:
-                    hook(alert_type, data)
-                except Exception as exc:
-                    logger.error("Alert hook error: %s", exc)
+            self._fire_alert(alert_type, data)
+
+        # ---- Trade-opened notifications ---------------------------------
+        # A closed trade fires TRADE_CLOSED from record_trade(); the open
+        # side has no equivalent hook — a filled execution only ever shows
+        # up in this cycle's result.executions, never again afterwards.
+        if result.executions:
+            for ex in result.executions:
+                if ex.status != ExecutionStatus.FILLED:
+                    continue
+                invested = self._position_notional(result.symbol, ex.volume, ex.fill_price)
+                self._fire_alert("TRADE_OPENED", {
+                    "symbol":         result.symbol,
+                    "direction":      result.decision.signal.name if result.decision else "?",
+                    "price":          round(ex.fill_price, 5),
+                    "size":           round(ex.volume, 4),
+                    "invested_value": round(invested, 2) if invested is not None else None,
+                    "confidence":     round(result.decision.confidence, 3) if result.decision else None,
+                    "ticket":         ex.ticket,
+                    "ts":             result.timestamp.isoformat(),
+                }, level=logging.INFO)
+
+    @staticmethod
+    def _position_notional(symbol: str, lots: float, price: float) -> Optional[float]:
+        """Position value in account currency ("valeur investie"): lots x
+        the symbol's real contract size x price. Falls back to lots x price
+        (directionally meaningful, just not unit-correct) when MT5 or the
+        symbol's contract size isn't available — never raises, this must
+        not break an alert over a missing nicety.
+        """
+        try:
+            import MetaTrader5 as mt5
+            info = mt5.symbol_info(symbol)
+            contract_size = getattr(info, "trade_contract_size", None) if info else None
+            if contract_size:
+                return float(lots) * float(contract_size) * float(price)
+        except Exception:
+            pass
+        return float(lots) * float(price)
+
+    def _fire_alert(self, alert_type: str, data: dict, level: int = logging.WARNING) -> None:
+        """Log, broadcast to the dashboard, and dispatch to registered alert
+        hooks (e.g. Telegram). Never raises — a bad hook must not break the
+        cycle that triggered it.
+        """
+        logger.log(level, "ALERT [%s]: %s", alert_type, data)
+        _broadcast("alert", {"type": alert_type, "message": f"{alert_type}: {data}", **data})
+        for hook in self._alert_hooks:
+            try:
+                hook(alert_type, data)
+            except Exception as exc:
+                logger.error("Alert hook error: %s", exc)
 
     # ------------------------------------------------------------------
     # In-memory reads (used by API)

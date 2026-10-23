@@ -58,6 +58,12 @@ class TradingStartRequest(BaseModel):
     ml_min_win_proba:     float       = Field(default_factory=lambda: settings.trading.ml_min_win_proba, ge=0.0, le=1.0)
     sl_atr_multiplier:   float       = Field(default_factory=lambda: settings.trading.sl_atr_multiplier, ge=1.0, le=5.0)
     tp_atr_multiplier:   float       = Field(default_factory=lambda: settings.trading.tp_atr_multiplier, ge=1.0, le=5.0)
+    # FTMO prop-firm compliance (Layer 1b in RiskEngine): hard-limits daily
+    # loss / drawdown to FTMO's actual rules (soft-stopped before their real
+    # 5% / 10% limits) instead of the generic kill-switch defaults, which are
+    # looser on drawdown (15-20%) than what FTMO would actually enforce.
+    ftmo_enabled:         bool        = False
+    ftmo_initial_balance: float       = Field(default=0.0, ge=0.0)
 
     class Config:
         json_schema_extra = {
@@ -94,99 +100,9 @@ class RetrainRequest(BaseModel):
     rl_interval_s:   int  = Field(default=1_800, ge=60, le=86_400)
 
 
-class TradingStatusResponse(BaseModel):
-    running:          bool
-    cycle_id:         int
-    emergency_active: bool
-    retry_count:      int
-    consecutive_ok:   int
-    strategies:       list[str]
-    symbols:          list[str]
-    equity:           float
-    balance:          float
-    open_positions:   int
-
-
-# ---------------------------------------------------------------------------
-# Portfolio
-# ---------------------------------------------------------------------------
-
-class PositionResponse(BaseModel):
-    symbol:        str
-    direction:     str
-    size:          float
-    entry_price:   float
-    unrealized_pnl: float
-    strategy:      str
-
-
-class PortfolioStatusResponse(BaseModel):
-    equity:          float
-    balance:         float
-    open_pnl:        float
-    daily_pnl:       float
-    daily_pnl_pct:   float
-    drawdown_pct:    float
-    high_water_mark: float
-    n_positions:     int
-    positions:       list[PositionResponse]
-    allocations:     dict[str, float]
-
-
-class EquityPoint(BaseModel):
-    ts:           str
-    equity:       float
-    balance:      float
-    open_pnl:     float
-    drawdown_pct: float
-    n_positions:  int
-
-
-class EconomicEventResponse(BaseModel):
-    timestamp: str
-    country:   str
-    name:      str
-    importance: str
-    forecast:  Optional[float] = None
-    previous:  Optional[float] = None
-    actual:    Optional[float] = None
-    revised:   Optional[float] = None
-    units:     Optional[str] = None
-    url:       Optional[str] = None
-
-
-class CalendarEventsResponse(BaseModel):
-    events: list[EconomicEventResponse] = Field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Strategies
-# ---------------------------------------------------------------------------
-
-class StrategyPerformanceResponse(BaseModel):
-    strategy:       str
-    n_trades:       int
-    win_rate:       float
-    cumulative_pnl: float
-    avg_pnl:        float
-    sharpe:         float
-    last_updated:   Optional[str]
-
-
-class StrategyToggleRequest(BaseModel):
-    enabled: bool
-
-
 # ---------------------------------------------------------------------------
 # Backtest
 # ---------------------------------------------------------------------------
-
-class BacktestSymbolData(BaseModel):
-    """Either a reference to a cached dataset or inline OHLCV records."""
-    symbol:    str
-    timeframe: str
-    source:    str = Field(default="feature_store", description="'feature_store' or 'inline'")
-
 
 class BacktestRequest(BaseModel):
     strategies:       list[str]       = Field(description="Strategy class names to include")
@@ -215,39 +131,6 @@ class BacktestJobStatus(str, Enum):
     RUNNING  = "running"
     DONE     = "done"
     FAILED   = "failed"
-
-
-class BacktestJobResponse(BaseModel):
-    job_id:       str
-    status:       BacktestJobStatus
-    submitted_at: str
-    started_at:   Optional[str]
-    completed_at: Optional[str]
-    duration_s:   Optional[float]
-    error:        Optional[str]
-
-
-class BacktestStrategyMetrics(BaseModel):
-    strategy:         str
-    total_return_pct: float
-    cagr:             float
-    sharpe:           float
-    sortino:          float
-    calmar:           float
-    max_drawdown_pct: float
-    n_trades:         int
-    win_rate:         float
-    profit_factor:    float
-    var_95:           float
-
-
-class BacktestResultResponse(BaseModel):
-    job_id:            str
-    status:            BacktestJobStatus
-    strategy_metrics:  list[BacktestStrategyMetrics]
-    portfolio_metrics: Optional[BacktestStrategyMetrics]
-    n_trades_total:    int
-    duration_s:        float
 
 
 # ---------------------------------------------------------------------------
@@ -279,29 +162,9 @@ class ClosePositionRequest(BaseModel):
     comment: str   = Field(default="manual_close", max_length=100)
 
 
-class TradeExecutionResponse(BaseModel):
-    status:         str
-    ticket:         Optional[str]
-    fill_price:     Optional[float]
-    slippage_points: Optional[float]
-    retries:        int
-    comment:        str
-
-
 # ---------------------------------------------------------------------------
 # Risk
 # ---------------------------------------------------------------------------
-
-class RiskStatusResponse(BaseModel):
-    ts:             str
-    total_exposure: float
-    daily_pnl:      float
-    daily_pnl_pct:  float
-    leverage:       float
-    n_positions:    int
-    var_95:         float
-    verdict:        str
-
 
 class RiskConfigUpdate(BaseModel):
     """Partial update — only provided fields are applied."""
@@ -310,29 +173,12 @@ class RiskConfigUpdate(BaseModel):
     max_position_size_pct:   Optional[float] = Field(default=None, ge=0.001, le=1.0)
     max_leverage:            Optional[float] = Field(default=None, ge=0.1, le=100.0)
     max_consecutive_losses:  Optional[int]   = Field(default=None, ge=1, le=50)
-
-
-class DrawdownPeriod(BaseModel):
-    start_ts:      str
-    end_ts:        Optional[str]
-    depth_pct:     float
-    duration_s:    int
-    recovered:     bool
-
-
-# ---------------------------------------------------------------------------
-# Trade history
-# ---------------------------------------------------------------------------
-
-class TradeRecord(BaseModel):
-    ts:           str
-    symbol:       str
-    strategy:     str
-    direction:    str
-    size:         float
-    entry_price:  float
-    exit_price:   float
-    pnl:          float
-    pnl_pct:      float
-    duration_s:   int
-    exit_reason:  str
+    # FTMO prop-firm compliance (RiskEngine Layer 1b) — runtime-toggleable so
+    # an already-running trader can be brought into FTMO compliance without
+    # a restart.
+    ftmo_enabled:                 Optional[bool]  = Field(default=None)
+    ftmo_initial_balance:         Optional[float] = Field(default=None, gt=0)
+    ftmo_daily_loss_pct:          Optional[float] = Field(default=None, ge=0.001, le=1.0)
+    ftmo_max_drawdown_pct:        Optional[float] = Field(default=None, ge=0.001, le=1.0)
+    ftmo_consistency_enabled:     Optional[bool]  = Field(default=None)
+    ftmo_consistency_max_day_pct: Optional[float] = Field(default=None, ge=0.001, le=1.0)

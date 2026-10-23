@@ -39,7 +39,6 @@ Reward function
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -60,7 +59,7 @@ logger = logging.getLogger(__name__)
 try:
     import gymnasium as gym
     from stable_baselines3 import PPO
-    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+    from stable_baselines3.common.vec_env import DummyVecEnv
     from stable_baselines3.common.callbacks import (
         EvalCallback,
         CheckpointCallback,

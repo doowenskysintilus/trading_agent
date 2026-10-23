@@ -19,17 +19,33 @@ progress/results are exposed via :meth:`status`.
 from __future__ import annotations
 
 import logging
+import shutil
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from pathlib import Path
+from typing import Callable, Optional
 
 import pandas as pd
 
-from research.training.dataset import build_supervised_dataset, load_experiences
+from research.training.dataset import build_supervised_dataset
 from strategies.ml_agent.win_classifier import WinClassifier
 
 logger = logging.getLogger(__name__)
+
+
+def _should_promote_rl(baseline_reward: Optional[float], candidate_reward: Optional[float]) -> bool:
+    """RL promotion decision, isolated for direct unit testing.
+
+    No baseline (nothing deployed yet, or baseline eval failed) -> always
+    promote. Otherwise reject only on a CLEAR regression: n_episodes=5 is a
+    small, noisy sample, so a generous relative+absolute margin avoids
+    discarding a genuinely better policy on eval noise alone.
+    """
+    if baseline_reward is None or candidate_reward is None:
+        return True
+    margin = max(0.5, 0.20 * abs(baseline_reward))
+    return candidate_reward >= baseline_reward - margin
 
 
 @dataclass
@@ -339,6 +355,32 @@ class RetrainService:
                        "agent. Provide more bars / populate the FeatureStore.")
                 print(f"\n[RL] ✗ {msg}\n", flush=True)
                 return {"trained": False, "message": msg}
+
+            # ---- Promotion gate: baseline the CURRENTLY DEPLOYED model on
+            # this run's test split BEFORE training overwrites it. -------
+            # RLTrainer.train() unconditionally calls self.save() at the
+            # end, writing over model_dir/model_name.zip — the exact file
+            # RLAlpha hot-reloads into the live trader. Warm-start already
+            # fine-tunes from those same weights, but a bad batch of new
+            # experience can still regress the policy (catastrophic
+            # forgetting) — nothing previously stopped that regressed
+            # model from replacing a better one. Snapshot + restore avoids
+            # touching RLTrainer.train()'s internals.
+            model_path  = Path(cfg.model_dir) / f"{cfg.model_name}.zip"
+            backup_path = model_path.with_suffix(".pre_retrain_backup.zip")
+            deployed_eval: Optional[dict] = None
+            has_backup = False
+            if model_path.exists() and len(test_f) > cfg.window_size + 2:
+                try:
+                    shutil.copy2(model_path, backup_path)
+                    has_backup = True
+                    baseline = RLTrainer(cfg)
+                    baseline.load(str(model_path))
+                    deployed_eval = baseline.evaluate(test_f, n_episodes=5)
+                except Exception as exc:
+                    logger.debug("RL baseline (deployed model) evaluation failed: %s", exc)
+                    deployed_eval = None
+
             if progress_callback is not None:
                 trainer.set_progress_callback(progress_callback)
             trainer.train(train_f, val_f, train_prices=train_p, val_prices=val_p)
@@ -351,13 +393,38 @@ class RetrainService:
                 except Exception as exc:
                     logger.warning("RL evaluation failed: %s", exc)
 
+            baseline_r = deployed_eval["mean_reward"] if deployed_eval else None
+            candidate_r = eval_results["mean_reward"] if eval_results else None
+            promoted = _should_promote_rl(baseline_r, candidate_r)
+            message  = "RL agent retrained (RecurrentPPO)."
+            if not promoted:
+                margin = max(0.5, 0.20 * abs(baseline_r))
+                message = (
+                    f"Candidate mean_reward={candidate_r:.4f} regressed vs "
+                    f"deployed mean_reward={baseline_r:.4f} (margin={margin:.4f}) "
+                    f"— reverted to the deployed model."
+                )
+                logger.warning(message)
+
+            if not promoted and has_backup:
+                shutil.copy2(backup_path, model_path)
+            if has_backup:
+                try:
+                    backup_path.unlink()
+                except OSError:
+                    pass
+
             result = {
                 "trained":    True,
                 "timesteps":  timesteps,
                 "train_bars": int(len(train_f)),
                 "val_bars":   int(len(val_f)),
                 "test_bars":  int(len(test_f)),
-                "message":    "RL agent retrained (RecurrentPPO).",
+                "message":    message,
+                "promoted":   promoted,
+                "deployed_eval_mean_reward": (
+                    round(deployed_eval["mean_reward"], 4) if deployed_eval else None
+                ),
                 **({
                     "eval_mean_reward": round(eval_results["mean_reward"], 4),
                     "eval_std_reward":  round(eval_results["std_reward"],  4),

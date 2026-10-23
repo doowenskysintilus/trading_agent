@@ -262,21 +262,9 @@ class PortfolioAllocator:
             self._custom_weights[name] = custom_weight
         logger.info("Registered strategy '%s' with base weight %.2f", name, initial_weight)
 
-    def deregister(self, name: str) -> None:
-        self._strategies.pop(name, None)
-        self._custom_weights.pop(name, None)
-
     def suspend(self, name: str) -> None:
         if name in self._strategies:
             self._strategies[name].status = StrategyStatus.SUSPENDED
-
-    def reactivate(self, name: str) -> None:
-        if name in self._strategies:
-            self._strategies[name].status = StrategyStatus.ACTIVE
-
-    def update_capital(self, new_total: float) -> None:
-        """Update total capital (e.g. after deposit / withdrawal)."""
-        self.total_capital = new_total
 
     # ------------------------------------------------------------------
     # PnL recording
@@ -566,13 +554,6 @@ class PortfolioAllocator:
         """Return a complete per-strategy performance and allocation summary."""
         return {
             name: stats.summary()
-            for name, stats in self._strategies.items()
-        }
-
-    def get_pnl_attribution(self) -> dict[str, float]:
-        """Total PnL contribution per strategy."""
-        return {
-            name: round(stats.total_pnl, 2)
             for name, stats in self._strategies.items()
         }
 

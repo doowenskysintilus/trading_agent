@@ -30,7 +30,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 
 try:
@@ -962,46 +961,3 @@ class RiskEngine:
             )
         else:
             logger.debug("RISK APPROVE — all checks passed.")
-
-    def get_risk_summary(self, ps: PortfolioState) -> dict:
-        """Quick snapshot of current risk metrics without evaluating trades."""
-        cfg = self.config
-        summary: dict = {
-            "equity":             round(ps.equity, 2),
-            "drawdown_pct":       round(ps.drawdown * 100, 2),
-            "daily_loss_pct":     round(ps.daily_loss_pct * 100, 2),
-            "gross_leverage":     round(ps.gross_leverage, 3),
-            "consecutive_losses": ps.consecutive_losses,
-            "kill_switch_active": self._kill_switch_active,
-            "headroom": {
-                "drawdown_remaining": round(
-                    (cfg.max_portfolio_drawdown_pct - ps.drawdown) * 100, 2
-                ),
-                "daily_loss_remaining": round(
-                    (cfg.max_daily_loss_pct - ps.daily_loss_pct) * 100, 2
-                ),
-                "leverage_remaining": round(
-                    cfg.max_gross_leverage - ps.gross_leverage, 3
-                ),
-            },
-        }
-
-        if cfg.ftmo_enabled:
-            initial = ps.ftmo_initial_balance if ps.ftmo_initial_balance > 0 else cfg.ftmo_initial_balance
-            today_loss     = max(0.0, ps.daily_start_equity - ps.equity)
-            today_loss_pct = today_loss / (initial + 1e-10)
-            total_dd_pct   = max(0.0, initial - ps.equity) / (initial + 1e-10)
-            summary["ftmo"] = {
-                "initial_balance":       round(initial, 2),
-                "current_equity":        round(ps.equity, 2),
-                "today_loss_pct":        round(today_loss_pct * 100, 2),
-                "total_drawdown_pct":    round(total_dd_pct * 100, 2),
-                "today_profit":          round(ps.ftmo_today_profit, 2),
-                "total_profit":          round(ps.ftmo_total_profit, 2),
-                "headroom_daily_pct":    round((cfg.ftmo_daily_loss_pct   - today_loss_pct) * 100, 2),
-                "headroom_drawdown_pct": round((cfg.ftmo_max_drawdown_pct - total_dd_pct)   * 100, 2),
-                "daily_limit_pct":       round(cfg.ftmo_daily_loss_pct   * 100, 1),
-                "drawdown_limit_pct":    round(cfg.ftmo_max_drawdown_pct * 100, 1),
-            }
-
-        return summary

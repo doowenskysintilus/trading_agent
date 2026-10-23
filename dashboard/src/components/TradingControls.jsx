@@ -48,6 +48,7 @@ export default function TradingControls({ running, emergency }) {
   const [mlMinWin,     setMlMinWin]     = useState(0.50)
   const [slMultiplier, setSlMultiplier] = useState(2.0)
   const [tpMultiplier, setTpMultiplier] = useState(4.0)
+  const [ftmoEnabled,  setFtmoEnabled]  = useState(false)
 
   // Pre-fill the panel with the defaults configured in .env (server-side).
   useEffect(() => {
@@ -133,10 +134,14 @@ export default function TradingControls({ running, emergency }) {
         ml_min_win_proba:  Math.min(Math.max(Number(mlMinWin) || 0, 0), 1),
         sl_atr_multiplier: Math.min(Math.max(Number(slMultiplier) || 2.0, 1.0), 5.0),
         tp_atr_multiplier: Math.min(Math.max(Number(tpMultiplier) || 4.0, 1.0), 5.0),
+        // FTMO mode reuses the same balance as both portfolio sizing seed
+        // and the immutable challenge reference (RiskEngine Layer 1b).
+        ftmo_enabled:         ftmoEnabled,
+        ftmo_initial_balance: ftmoEnabled ? bal : 0,
       })
       setOpen(false)
     } catch { /* error already surfaced */ }
-  }, [callApi, symbols, timeframe, interval, warmupBars, useMaxBars, balance, allocation, htfEnabled, htfTimeframe, mlEnabled, mlMinWin])
+  }, [callApi, symbols, timeframe, interval, warmupBars, useMaxBars, balance, allocation, htfEnabled, htfTimeframe, mlEnabled, mlMinWin, ftmoEnabled])
 
   const handleStop = useCallback(async () => {
     try {
@@ -361,6 +366,27 @@ export default function TradingControls({ running, emergency }) {
               />
             </div>
           </div>
+
+          <div className="tc-row">
+            <div className="tc-field">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={ftmoEnabled}
+                  onChange={(e) => setFtmoEnabled(e.target.checked)}
+                  style={{ marginRight: 6, verticalAlign: 'middle' }}
+                />
+                FTMO compliance mode
+              </label>
+            </div>
+          </div>
+          {ftmoEnabled && (
+            <p className="tc-hint">
+              Enforces FTMO's actual limits (daily loss 5%, drawdown 10%, soft-stopped
+              earlier) against the Initial Balance above as the fixed challenge
+              reference — stricter than the generic risk limits otherwise used.
+            </p>
+          )}
 
           {error && <div className="tc-error">{error}</div>}
 

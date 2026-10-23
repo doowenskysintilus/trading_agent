@@ -44,11 +44,8 @@ import numpy as np
 import pandas as pd
 
 from backtesting.metrics import MetricsCalculator, PerformanceMetrics, compare_metrics
-from engines.risk_engine.risk_engine import (
-    PortfolioState, RiskConfig, RiskEngine, RiskVerdict, TradeOrder, OpenPosition,
-)
-from engines.signal_engine.signal_aggregator import AggregatedDecision, SignalAggregator
-from engines.portfolio_engine.portfolio_engine import AllocationMethod, PortfolioAllocator
+from engines.risk_engine.risk_engine import RiskConfig
+from engines.portfolio_engine.portfolio_engine import AllocationMethod
 from research.alpha_models.base import AlphaModel, SignalType
 
 logger = logging.getLogger(__name__)
@@ -468,7 +465,7 @@ class BacktestEngine:
 
         # Align all curves on common index
         combined = pd.DataFrame(equity_curves)
-        combined = combined.fillna(method="ffill").dropna()
+        combined = combined.ffill().dropna()
 
         if combined.empty:
             return None

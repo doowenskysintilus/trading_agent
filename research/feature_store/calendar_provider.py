@@ -24,14 +24,11 @@ Usage
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
-
-import numpy as np
-import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +38,29 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _parse_float(value: any) -> Optional[float]:
-    """Safely parse a value to float, handling None and non-numeric strings."""
+    """Safely parse a value to float, handling None and non-numeric strings.
+
+    Trading Economics returns numeric fields as strings with unit suffixes
+    (e.g. "216K", "3.2%", "1.05M") — strip any trailing non-numeric
+    characters rather than failing outright. Doesn't rescale by the unit
+    (K/M/B), which is fine as long as actual/forecast/previous for the same
+    event share the same unit (they do), since only their ratio is used.
+    """
     if value is None or value == '':
         return None
+    if isinstance(value, (int, float)):
+        return float(value)
     try:
         return float(value)
     except (ValueError, TypeError):
+        pass
+    import re
+    match = re.match(r"^\s*(-?[\d.,]+)", str(value))
+    if not match:
+        return None
+    try:
+        return float(match.group(1).replace(",", ""))
+    except ValueError:
         return None
 
 
@@ -82,12 +96,6 @@ class EconomicEvent:
         if self.actual is None or self.forecast is None or self.forecast == 0:
             return None
         return (self.actual - self.forecast) / abs(self.forecast)
-    
-    def is_upcoming(self, hours_ahead: int = 1) -> bool:
-        """Check if event is within N hours in the future."""
-        now = datetime.now(timezone.utc)
-        target = now + timedelta(hours=hours_ahead)
-        return now < self.timestamp <= target
     
     def is_active(self, window_minutes: int = 30) -> bool:
         """Check if event is happening now (within window_minutes before/after)."""
@@ -227,32 +235,6 @@ class CalendarProvider:
             countries = [self._SYMBOL_CURRENCIES.get(symbol, "USD")]
         
         return self.get_upcoming_events(next_n_hours, countries, min_importance)
-    
-    def get_events_at_time(
-        self,
-        timestamp: datetime,
-        window_minutes: int = 30,
-    ) -> list[EconomicEvent]:
-        """
-        Get events happening near a specific timestamp.
-        
-        Parameters
-        ----------
-        timestamp : datetime
-            Reference time
-        window_minutes : int
-            Minutes before/after to include
-        
-        Returns
-        -------
-        list[EconomicEvent]
-            Events in the time window
-        """
-        start = timestamp - timedelta(minutes=window_minutes)
-        end = timestamp + timedelta(minutes=window_minutes)
-        
-        events = self._fetch_events()
-        return [e for e in events if start <= e.timestamp <= end]
     
     def event_is_active(
         self,
@@ -408,85 +390,168 @@ class CalendarProvider:
         return []
     
     def _fetch_fred(self) -> list[EconomicEvent]:
-        """Fetch from FRED API (Federal Reserve Economic Data).
-        
-        Note: Requires `pip install fredapi`. Get API key from:
-        https://fred.stlouisfed.org/docs/api/
+        """Fetch upcoming US release dates from FRED (supplementary source).
+
+        FRED itself is a time-series API, not an event calendar — but its
+        release/dates REST endpoint does expose the *scheduled* future dates
+        of major US data releases when queried with a future realtime_start,
+        which is genuinely forward-looking (unlike the historical series
+        data). Covers only a small curated list of high-impact US releases;
+        use Trading Economics for broader / global coverage.
+
+        Calls the raw REST API directly rather than going through the
+        `fredapi` package — that package only wraps FRED's *series* data
+        endpoints (get_series, get_series_info, ...), it has no method for
+        the release-dates endpoint at all (confirmed against fredapi 0.5.2).
+
+        Note: FRED release dates are date-only (no time-of-day), unlike
+        Trading Economics — events are anchored at 00:00 UTC on the release
+        date as an approximation.
         """
         try:
-            from fredapi import Fred
+            import requests
         except ImportError:
-            logger.warning("fredapi not installed. Install via: pip install fredapi")
+            logger.warning("requests not installed; skipping FRED calendar source.")
             return []
-        
-        # For now, return empty (FRED is primarily for time-series data, not event calendar)
-        # Would need supplementary event data source (e.g., integrate with Trading Economics API)
-        logger.info("FRED provider selected (requires supplementary event calendar API)")
-        return []
-    
+
+        from config.settings import settings as cfg
+        api_key = getattr(cfg.trading, "fred_api_key", "")
+        if not api_key:
+            logger.info("TRADING_FRED_API_KEY not set — skipping FRED calendar source.")
+            return []
+
+        now     = datetime.now(timezone.utc)
+        horizon = now + timedelta(days=60)
+        events: list[EconomicEvent] = []
+
+        # Release IDs verified against GET /fred/releases (name match) — do
+        # not guess these, FRED's IDs are not obvious from the release name.
+        # release_id 101 ("FOMC Press Release") was tried and dropped: it
+        # returns a release_date for EVERY single calendar day with no gaps
+        # (confirmed by direct query), so it does not represent discrete
+        # FOMC decision dates the way this curated list assumes — including
+        # it would flag every day as a HIGH-impact event and, combined with
+        # RiskEngine Layer 0, block trading almost permanently. Trading
+        # Economics (the primary calendar source) covers rate decisions as
+        # proper discrete events instead.
+        releases = {
+            50: ("Employment Situation (NFP)", EventImportance.HIGH),
+            10: ("Consumer Price Index",        EventImportance.HIGH),
+            53: ("Gross Domestic Product",      EventImportance.HIGH),
+            46: ("Producer Price Index",        EventImportance.MEDIUM),
+        }
+
+        for release_id, (name, importance) in releases.items():
+            try:
+                resp = requests.get(
+                    "https://api.stlouisfed.org/fred/release/dates",
+                    params={
+                        "release_id": release_id,
+                        "api_key": api_key,
+                        "file_type": "json",
+                        "realtime_start": now.strftime("%Y-%m-%d"),
+                        "realtime_end": horizon.strftime("%Y-%m-%d"),
+                        "include_release_dates_with_no_data": "true",
+                    },
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                logger.debug(f"FRED release/dates({release_id}) failed: {e}")
+                continue
+
+            release_dates = data.get("release_dates", [])
+            # Defensive sanity cap: a genuine monthly/quarterly release
+            # yields at most ~2 dates in a 60-day window. More than that
+            # means this release_id doesn't behave as a discrete calendar
+            # event (as happened with 101 above) — skip it rather than
+            # spam misleading "events" that would trip the event blackout.
+            if len(release_dates) > 4:
+                logger.warning(
+                    f"FRED release_id={release_id} ('{name}') returned "
+                    f"{len(release_dates)} dates in {(horizon - now).days}d — "
+                    f"not a discrete event release, skipping."
+                )
+                continue
+
+            for item in release_dates:
+                try:
+                    ts = datetime.strptime(item["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                except (KeyError, ValueError):
+                    continue
+                if now < ts <= horizon:
+                    events.append(EconomicEvent(
+                        timestamp=ts, country="USD", name=name, importance=importance,
+                    ))
+
+        if events:
+            logger.info(f"✓ Fetched {len(events)} scheduled release dates from FRED")
+        return sorted(events, key=lambda e: e.timestamp)
+
     def _fetch_trading_economics(self) -> list[EconomicEvent]:
-        """Fetch from Trading Economics API (real-time calendar).
-        
-        Tries multiple TE endpoints and falls back to mock if unavailable.
-        Requires internet connection. Free tier works (rate-limited).
+        """Fetch from the real Trading Economics Calendar API (JSON REST,
+        not the HTML calendar page the previous implementation hit — that
+        endpoint never returned parseable data and always fell back to mock).
+
+        Docs: https://docs.tradingeconomics.com/calendar/
+        A registered TRADING_CALENDAR_API_KEY is required for anything
+        beyond the very limited 'guest:guest' demo tier. Falls back to mock
+        data if the key is missing, the request fails, or the response
+        shape doesn't match what's expected.
         """
         try:
             import requests
         except ImportError:
             logger.warning("requests not installed; using mock calendar. Install via: pip install requests")
             return self._fetch_mock()
-        
-        # Try multiple TE API endpoints
+
+        from config.settings import settings as cfg
+        api_key = getattr(cfg.trading, "calendar_api_key", "") or "guest:guest"
+
+        now = datetime.now(timezone.utc)
+        d1  = now.strftime("%Y-%m-%d")
+        d2  = (now + timedelta(days=8)).strftime("%Y-%m-%d")
+
+        # Try the two documented endpoint shapes — the calendar root defaults
+        # to all countries on most accounts, but some keys require the
+        # explicit /country/all path with a date range.
         endpoints = [
-            ("https://tradingeconomics.com/calendar", {"method": "web"}),  # Web scrape endpoint
+            ("https://api.tradingeconomics.com/calendar", {"c": api_key}),
+            ("https://api.tradingeconomics.com/calendar/country/all", {"c": api_key, "d1": d1, "d2": d2}),
         ]
-        
+
         for url, params in endpoints:
             try:
                 logger.debug(f"Trying Trading Economics endpoint: {url}")
-                
-                # Optional: add API key for higher rate limits
-                from config.settings import settings as cfg
-                if hasattr(cfg, 'trading') and hasattr(cfg.trading, 'calendar_api_key'):
-                    if cfg.trading.calendar_api_key:
-                        params['apikey'] = cfg.trading.calendar_api_key
-                
-                response = requests.get(url, params=params, timeout=5, verify=False)
+                response = requests.get(url, params=params, timeout=10)
                 response.raise_for_status()
-                
-                # Try to parse HTML/JSON response
-                try:
-                    data = response.json()
-                except ValueError:
-                    # Try HTML parsing if JSON fails
-                    logger.debug("TE response not JSON, trying HTML parsing")
-                    # For now, skip HTML parsing and fall back to mock
-                    continue
-                
-                events = []
-                
-                if isinstance(data, list):
-                    # API returned list of events
-                    for item in data:
-                        try:
-                            event = self._parse_te_event(item)
-                            if event and event.timestamp > datetime.now(timezone.utc):
-                                events.append(event)
-                        except Exception as e:
-                            logger.debug(f"Error parsing TE event: {e}")
-                            continue
-                
-                if events:
-                    logger.info(f"✓ Fetched {len(events)} REAL events from Trading Economics")
-                    return sorted(events, key=lambda e: e.timestamp)
-                    
+                data = response.json()
             except requests.exceptions.RequestException as e:
                 logger.debug(f"TE endpoint failed ({url}): {e}")
                 continue
-            except Exception as e:
-                logger.debug(f"Unexpected error with TE endpoint ({url}): {e}")
+            except ValueError as e:
+                logger.debug(f"TE endpoint ({url}) returned non-JSON: {e}")
                 continue
-        
+
+            if not isinstance(data, list):
+                logger.debug(f"TE endpoint ({url}) returned unexpected shape: {type(data)}")
+                continue
+
+            events = []
+            for item in data:
+                try:
+                    event = self._parse_te_event(item)
+                    if event and event.timestamp > now:
+                        events.append(event)
+                except Exception as e:
+                    logger.debug(f"Error parsing TE event: {e}")
+                    continue
+
+            if events:
+                logger.info(f"✓ Fetched {len(events)} REAL events from Trading Economics")
+                return sorted(events, key=lambda e: e.timestamp)
+
         # All TE endpoints failed — fall back to mock
         logger.info("Trading Economics unavailable; using MOCK calendar for demo")
         return self._fetch_mock()
@@ -524,13 +589,27 @@ class CalendarProvider:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             
-            # Map importance
-            importance_str = item.get('Importance', 'medium').lower()
-            importance = {
-                'low': EventImportance.LOW,
-                'medium': EventImportance.MEDIUM,
-                'high': EventImportance.HIGH,
-            }.get(importance_str, EventImportance.MEDIUM)
+            # Map importance — the real TE API returns an int (0-3: 0/1=Low,
+            # 2=Medium, 3=High), while string forms ('low'/'medium'/'high')
+            # are kept for compatibility with other possible sources.
+            raw_importance = item.get('Importance', EventImportance.MEDIUM.value)
+            if isinstance(raw_importance, str):
+                importance = {
+                    'low': EventImportance.LOW,
+                    'medium': EventImportance.MEDIUM,
+                    'high': EventImportance.HIGH,
+                }.get(raw_importance.lower(), EventImportance.MEDIUM)
+            else:
+                try:
+                    imp_int = int(raw_importance)
+                except (TypeError, ValueError):
+                    imp_int = EventImportance.MEDIUM.value
+                importance = {
+                    0: EventImportance.LOW,
+                    1: EventImportance.LOW,
+                    2: EventImportance.MEDIUM,
+                    3: EventImportance.HIGH,
+                }.get(imp_int, EventImportance.MEDIUM)
             
             # Extract country
             country = item.get('Country', 'USD')
@@ -561,12 +640,3 @@ class CalendarProvider:
         except Exception as e:
             logger.debug(f"_parse_te_event error: {e}")
             return None
-
-
-# ---------------------------------------------------------------------------
-# Convenience function
-# ---------------------------------------------------------------------------
-
-def get_calendar_provider(source: str = "mock") -> CalendarProvider:
-    """Factory function to create provider with error handling."""
-    return CalendarProvider(source=source)

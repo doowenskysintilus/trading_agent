@@ -31,11 +31,9 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
-
-import numpy as np
 
 # MT5 is an optional runtime dependency
 try:
@@ -61,6 +59,24 @@ _REQUOTE_CODES  = {10004, 10020}            # REQUOTE, PRICE_CHANGED
 _INVALID_FILL   = 10030                     # TRADE_RETCODE_INVALID_FILL
 _REJECT_CODES   = {10006, 10007, 10014,     # REJECT, CANCEL, INVALID_VOLUME
                    10017, 10018, 10019}     # MARKET_CLOSED, NO_MONEY, etc.
+
+# MT5 DEAL_REASON_* — why a deal happened, read off the closing deal so
+# TRADE_CLOSED notifications can say "stop-loss" / "manual" instead of a
+# generic "closed". EXPERT covers both our own signal-driven closes AND any
+# order sent through this same API (e.g. a dashboard "close" click) — MT5
+# doesn't distinguish those from an actual standalone EA at the deal level.
+_DEAL_REASON_LABELS = {
+    0: "manual (desktop)",
+    1: "manual (mobile)",
+    2: "manual (web)",
+    3: "system/API",
+    4: "stop-loss",
+    5: "take-profit",
+    6: "stop-out (margin)",
+    7: "rollover",
+    8: "variation margin",
+    9: "split",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +320,23 @@ class MT5ExecutionEngine:
             self._connected = False
             logger.info("MT5 disconnected.")
 
+    def ensure_connected(self) -> bool:
+        """Verify the MT5 connection is alive and reconnect if it dropped.
+
+        mt5.initialize() is otherwise only ever called once at startup
+        (via connect() / the `with` context manager) — a network blip or
+        terminal restart mid-run would then leave every subsequent MT5 call
+        failing silently (None), with the trading loop retrying forever in
+        DATA_ERROR and never actually recovering. Call this once per cycle.
+        """
+        if not _MT5_AVAILABLE:
+            return False
+        if self._connected and mt5.terminal_info() is not None and mt5.account_info() is not None:
+            return True
+        logger.warning("MT5 connection appears down — attempting reconnect.")
+        self._connected = False
+        return self.connect()
+
     def __enter__(self) -> "MT5ExecutionEngine":
         self.connect()
         return self
@@ -370,10 +403,17 @@ class MT5ExecutionEngine:
         price        = tick.ask if direction == +1 else tick.bid
         sl, tp       = self._compute_sl_tp(trade, price, direction)
 
+        volume = self._normalize_volume(trade.symbol, trade.size)
+        if volume <= 0:
+            return ExecutionResult(
+                status=ExecutionStatus.REJECTED,
+                message=f"Normalized volume is 0 for {trade.symbol} — no symbol info / broker limits unavailable.",
+            )
+
         request = {
             "action":     mt5.TRADE_ACTION_DEAL,
             "symbol":     trade.symbol,
-            "volume":     round(float(trade.size), 2),
+            "volume":     volume,
             "type":       order_type,
             "price":      price,
             "sl":         sl,
@@ -532,27 +572,67 @@ class MT5ExecutionEngine:
     def get_closed_pnl(self, position_ticket: int) -> Optional[dict]:
         """Realized result of a closed position from MT5 deal history.
 
-        Returns {"pnl": net_pnl, "exit_price": price} where net_pnl sums
-        profit + swap + commission across all deals of the position, or None
-        if the position id has no history yet (still open / not found).
+        Returns {"pnl": net_pnl, "exit_price": price, "exit_reason": label}
+        where net_pnl sums profit + swap + commission across all deals of
+        the position, exit_reason is a human label derived from the closing
+        deal's DEAL_REASON_* (e.g. "stop-loss", "take-profit", "manual
+        (desktop)"), or None if the position id has no history yet (still
+        open / not found).
         """
         if not self._connected or not _MT5_AVAILABLE:
             return None
         deals = mt5.history_deals_get(position=position_ticket)
         if not deals:
             return None
-        pnl        = 0.0
-        exit_price = 0.0
+        pnl         = 0.0
+        exit_price  = 0.0
+        exit_reason = "unknown"
         for d in deals:
             pnl += d.profit + getattr(d, "swap", 0.0) + getattr(d, "commission", 0.0)
             # DEAL_ENTRY_OUT == 1 marks the closing deal.
             if getattr(d, "entry", None) == 1:
-                exit_price = d.price
-        return {"pnl": pnl, "exit_price": exit_price}
+                exit_price  = d.price
+                exit_reason = _DEAL_REASON_LABELS.get(getattr(d, "reason", None), "unknown")
+        return {"pnl": pnl, "exit_price": exit_price, "exit_reason": exit_reason}
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _normalize_volume(self, symbol: str, raw_size: float) -> float:
+        """Convert a position size in raw base-currency units (what the
+        risk/sizing math in LiveTrader._build_trade_order produces — e.g.
+        "166,666 units of EURUSD") into MT5's `volume` field, which is
+        denominated in LOTS (1.0 lot = symbol's trade_contract_size units,
+        typically 100,000 for FX but different for metals/crypto/CFDs).
+
+        Previously `trade.size` was sent to MT5 unconverted — a sizing
+        result of 166,666 (units) was submitted as a request for 166,666
+        LOTS, which every broker rejects (retcode 10014 INVALID_VOLUME)
+        since it's orders of magnitude past any symbol's volume_max.
+
+        Also clips to [volume_min, volume_max] and rounds to volume_step,
+        each of which independently trigger the same retcode if violated.
+        """
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            return 0.0
+
+        contract_size = getattr(info, "trade_contract_size", 0.0) or 100_000.0
+        lots = float(raw_size) / contract_size
+
+        vol_min  = getattr(info, "volume_min", 0.01) or 0.01
+        vol_max  = getattr(info, "volume_max", 100.0) or 100.0
+        vol_step = getattr(info, "volume_step", 0.01) or 0.01
+
+        lots = max(vol_min, min(lots, vol_max))
+        # Round to the nearest allowed step (brokers reject volumes that
+        # aren't an exact multiple of volume_step too).
+        steps = round(lots / vol_step)
+        lots  = round(steps * vol_step, 8)
+        lots  = max(vol_min, min(lots, vol_max))
+
+        return lots
 
     def _resolve_filling_mode(self, symbol: str) -> int:
         """Return the correct ORDER_FILLING_* constant for a symbol.

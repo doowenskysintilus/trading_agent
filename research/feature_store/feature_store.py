@@ -34,7 +34,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 
 from research.feature_store.feature_engineer import FeatureConfig, FeatureEngineer
@@ -301,57 +300,6 @@ class FeatureStore:
     def exists(self, symbol: str, timeframe: str, version: Optional[str] = None) -> bool:
         path = self._parquet_path(symbol, timeframe, version or self.version)
         return path.exists()
-
-    def get_feature_names(self, symbol: str, timeframe: str, version: Optional[str] = None) -> list[str]:
-        """Return column names without loading the full file."""
-        path = self._parquet_path(symbol, timeframe, version or self.version)
-        if not path.exists():
-            raise FileNotFoundError(f"No cache found for {symbol}/{timeframe}.")
-        return pd.read_parquet(path, engine="pyarrow").columns.tolist()
-
-    def get_matrix(
-        self,
-        symbol: str,
-        timeframe: str,
-        version: Optional[str] = None,
-        exclude: Optional[list[str]] = None,
-    ) -> np.ndarray:
-        """
-        Load features and return a raw float32 numpy array (ML-ready).
-
-        OHLCV columns are excluded by default unless explicitly included.
-        """
-        exclude = exclude or ["open", "high", "low", "close", "volume"]
-        df = self.load(symbol, timeframe, version)
-        df = df.drop(columns=[c for c in exclude if c in df.columns])
-        return df.values.astype(np.float32)
-
-    # ------------------------------------------------------------------
-    # Multi-symbol batch
-    # ------------------------------------------------------------------
-
-    def build_batch(
-        self,
-        datasets: dict[tuple[str, str], pd.DataFrame],
-        version: Optional[str] = None,
-        overwrite: bool = False,
-    ) -> dict[tuple[str, str], pd.DataFrame]:
-        """
-        Build features for multiple (symbol, timeframe) pairs at once.
-
-        Parameters
-        ----------
-        datasets : dict
-            {(symbol, timeframe): ohlcv_df}
-
-        Returns
-        -------
-        dict  {(symbol, timeframe): feature_df}
-        """
-        results: dict[tuple[str, str], pd.DataFrame] = {}
-        for (symbol, tf), df in datasets.items():
-            results[(symbol, tf)] = self.build(df, symbol, tf, version, overwrite)
-        return results
 
     # ------------------------------------------------------------------
     # Internal helpers

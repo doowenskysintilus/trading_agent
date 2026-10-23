@@ -1,0 +1,29 @@
+{
+  "//": "Copy this file to accounts.json (gitignored, like .env) and fill in real credentials. Each entry launches its own full API instance (LiveTrader + MT5 connection) on its own port — see run_all_accounts.py.",
+  "accounts": [
+    {
+      "id": "ftmo-10k-a",
+      "label": "FTMO 10k #1",
+      "api_port": 8000,
+      "mt5_login": 1514217746,
+      "mt5_password": "",
+      "mt5_server": "FTMO-Demo",
+      "mt5_path": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
+      "initial_balance": 10000,
+      "ftmo_enabled": true,
+      "ftmo_initial_balance": 10000
+    },
+    {
+      "id": "ftmo-10k-b",
+      "label": "FTMO 10k #2",
+      "api_port": 8001,
+      "mt5_login": 0,
+      "mt5_password": "",
+      "mt5_server": "FTMO-Demo",
+      "mt5_path": "C:\\Program Files\\MetaTrader 5 - Account B\\terminal64.exe",
+      "initial_balance": 10000,
+      "ftmo_enabled": true,
+      "ftmo_initial_balance": 10000
+    }
+  ]
+}

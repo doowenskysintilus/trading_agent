@@ -25,7 +25,7 @@ Configuration
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -284,9 +284,3 @@ class CalendarAlpha(AlphaModel):
             strategy_name=self._name,
             metadata=meta,
         )
-
-
-# Backward-compatible helper
-def _get_base() -> type:
-    """Return the base class for import compatibility."""
-    return AlphaModel

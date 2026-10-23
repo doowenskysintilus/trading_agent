@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import signal
 import threading
 import time
@@ -70,6 +69,7 @@ from engines.signal_engine.signal_aggregator import (
     SignalAggregator,
 )
 from research.alpha_models.base import AlphaModel, AlphaSignal, SignalType
+from research.feature_store.calendar_provider import CalendarProvider
 from research.feature_store.feature_engineer import FeatureConfig, FeatureEngineer
 from live_trading.experience_collector import ExperienceCollector, extract_observation
 from strategies.ml_agent.win_classifier import WinClassifier
@@ -137,14 +137,15 @@ def _fmt_meta(meta: dict) -> str:
 # ---------------------------------------------------------------------------
 
 class CycleStatus(Enum):
-    OK            = auto()
-    NO_SIGNAL     = auto()
-    ML_FILTERED   = auto()
-    RISK_BLOCKED  = auto()
-    EXECUTION_ERR = auto()
-    DATA_ERROR    = auto()
-    EMERGENCY     = auto()
-    ERROR         = auto()
+    OK               = auto()
+    NO_SIGNAL        = auto()
+    ML_FILTERED      = auto()
+    RISK_BLOCKED     = auto()
+    EXECUTION_ERR    = auto()
+    DATA_ERROR       = auto()
+    EMERGENCY        = auto()
+    ERROR            = auto()
+    BAR_ALREADY_TRADED = auto()   # same symbol already acted on this bar
 
 
 # ---------------------------------------------------------------------------
@@ -234,10 +235,31 @@ class LiveTraderConfig:
     # ---- Signal aggregation ---------------------------------------------
     min_confidence: float = 0.45    # signals below this are ignored
 
+    # ---- Market regime detection -----------------------------------------
+    # Reweights momentum vs mean-reversion per symbol per cycle based on
+    # whether price action looks trending or choppy/ranging (Kaufman
+    # Efficiency Ratio). Momentum strategies work better in trends,
+    # mean-reversion in ranges — previously both ran with static weights
+    # all the time regardless of regime.
+    regime_enabled:            bool  = True
+    regime_window:             int   = 20     # bars of lookback for the ER
+    regime_trending_threshold: float = 0.5    # ER >= this -> "trending"
+    regime_ranging_threshold:  float = 0.25   # ER <= this -> "ranging"
+    regime_weight_boost:       float = 1.5    # favoured strategy multiplier
+    regime_weight_cut:         float = 0.5    # disfavoured strategy multiplier
+
     # ---- Risk engine ----------------------------------------------------
     risk_config: RiskConfig = field(default_factory=RiskConfig)
     sl_atr_multiplier: float = 2.0
     tp_atr_multiplier: float = 4.0
+
+    # ---- Economic calendar (feeds RiskEngine Layers 0/4 + CalendarAlpha) -
+    # Previously nothing ever passed a CalendarProvider to RiskEngine here,
+    # so the event-blackout and event-aware volatility sizing layers were
+    # always inert in live trading regardless of source/mock config. The
+    # API key itself is read by CalendarProvider from settings.trading —
+    # not duplicated here.
+    calendar_source: str = ""   # "" -> settings.trading.calendar_source
 
     # ---- Portfolio allocation -------------------------------------------
     allocation_method: AllocationMethod = AllocationMethod.RISK_PARITY
@@ -411,7 +433,11 @@ class LiveTrader:
         # ---- Sub-engines ------------------------------------------------
         self._feature_eng  = FeatureEngineer(self.cfg.feature_config)
         self._aggregator   = SignalAggregator()
-        self._risk_engine  = RiskEngine(self.cfg.risk_config)
+        self._calendar_provider = self._build_calendar_provider()
+        self._risk_engine  = RiskEngine(
+            self.cfg.risk_config,
+            calendar_provider=self._calendar_provider,
+        )
         self._allocator    = PortfolioAllocator(
             total_capital   = self.cfg.initial_balance,
         )
@@ -457,6 +483,17 @@ class LiveTrader:
 
         # ---- Strategies -------------------------------------------------
         self._strategies: list[AlphaModel] = []
+        # Original user-configured weight per strategy, kept separate from
+        # SignalAggregator's live base weight so regime reweighting (which
+        # overwrites the aggregator's base weight every cycle) always scales
+        # from the true original instead of compounding onto last cycle's
+        # already-adjusted value.
+        self._strategy_base_weights: dict[str, float] = {}
+        self._last_regime: dict[str, str] = {}   # symbol -> last detected regime
+        # Bar timestamp of the last symbol we seriously considered trading
+        # (reached the confidence gate) — see the bar-dedup gate in
+        # _run_cycle for why this exists.
+        self._last_signal_bar: dict[str, pd.Timestamp] = {}
 
         # ---- Monitoring hooks -------------------------------------------
         self._hooks: list[MonitoringHook] = [
@@ -499,6 +536,31 @@ class LiveTrader:
                     self.cfg.symbols, self.cfg.timeframe)
 
     # ------------------------------------------------------------------
+    # Economic calendar
+    # ------------------------------------------------------------------
+
+    def _build_calendar_provider(self) -> Optional[CalendarProvider]:
+        """Build the CalendarProvider that feeds RiskEngine Layers 0/4.
+
+        Falls back to settings.trading.calendar_source ("mock" by default)
+        when cfg.calendar_source is left blank. Never raises — a broken
+        calendar source should degrade to no event-awareness, not crash
+        the trader.
+        """
+        source = self.cfg.calendar_source
+        if not source:
+            try:
+                from config.settings import settings as _settings
+                source = _settings.trading.calendar_source or "mock"
+            except Exception:
+                source = "mock"
+        try:
+            return CalendarProvider(source=source)
+        except Exception as exc:
+            logger.warning("CalendarProvider init failed (source=%s): %s", source, exc)
+            return None
+
+    # ------------------------------------------------------------------
     # Strategy and hook registration
     # ------------------------------------------------------------------
 
@@ -510,6 +572,7 @@ class LiveTrader:
     ) -> "LiveTrader":
         """Register an AlphaModel and its signal weight."""
         self._strategies.append(model)
+        self._strategy_base_weights[model.name] = weight
         self._aggregator.set_weight(model.name, weight)
         self._allocator.register(
             name           = model.name,
@@ -607,6 +670,9 @@ class LiveTrader:
                 if self._stop_event.is_set() or self._emergency.is_active:
                     break
                 self._run_with_recovery(symbol)
+
+            # ---- Refresh cross-symbol returns matrix (correlation risk) -
+            self._update_returns_matrix()
 
             # ---- Record PnL of trades closed by SL/TP (learning loop) ---
             self._reconcile_closed_trades()
@@ -716,6 +782,31 @@ class LiveTrader:
                 return result
             result.n_bars = len(data)
 
+            # 1b. One full analysis pass per symbol per bar -----------------
+            # cycle_interval_seconds can legitimately run much shorter than
+            # the timeframe (faster trailing-stop updates), which means the
+            # same bar gets re-fetched many times before it closes — e.g.
+            # every 3s on an M1 timeframe is ~20 re-evaluations of the exact
+            # same candle. Gating here (before feature/signal computation),
+            # not just before execution, matters for two reasons: it avoids
+            # wasted computation, and — more importantly — rl_agent's LSTM
+            # hidden state STEPS FORWARD on every compute() call. Gating only
+            # at the execution boundary still let the RL agent "see" the same
+            # unchanged bar 20 times per minute, advancing its temporal state
+            # on non-events it was never trained to expect. Confirmed live
+            # before this existed: 14 stacked SELL positions on 2 symbols
+            # within 7 cycles / 21 seconds, all at ~the same price.
+            current_bar_ts = data.index[-1]
+            if self._last_signal_bar.get(symbol) == current_bar_ts:
+                if self.cfg.verbose_signals:
+                    logger.info(
+                        "    [%s] Already analysed bar %s — skipping re-analysis",
+                        symbol, current_bar_ts,
+                    )
+                result.status = CycleStatus.BAR_ALREADY_TRADED
+                return result
+            self._last_signal_bar[symbol] = current_bar_ts
+
             # 2. Compute features -----------------------------------------
             features = self._compute_features(data)
             result.n_features = features.shape[1]
@@ -733,6 +824,9 @@ class LiveTrader:
             if not signals:
                 result.status = CycleStatus.NO_SIGNAL
                 return result
+
+            # 3b. Reweight momentum/mean-reversion for this symbol's regime -
+            self._apply_regime_weighting(symbol)
 
             # 4. Aggregate signals ----------------------------------------
             decision = self._aggregate_signals(signals)
@@ -927,6 +1021,80 @@ class LiveTrader:
             logger.warning("[%s] HTF trend computation failed: %s", symbol, exc)
             return SignalType.HOLD
 
+    # ------------------------------------------------------------------
+    # Stage 1c — Market regime detection
+    # ------------------------------------------------------------------
+
+    # Strategy names whose weight is boosted/cut per detected regime.
+    # Matched by exact registered strategy name (same convention already
+    # used elsewhere, e.g. api/main.py's RL-agent registration check).
+    _REGIME_TREND_FAVORED = {"momentum"}
+    _REGIME_RANGE_FAVORED = {"mean_reversion"}
+
+    def _detect_regime(self, symbol: str) -> str:
+        """Classify the current regime via the Kaufman Efficiency Ratio:
+
+            ER = |close[-1] - close[-N]| / sum(|close[i] - close[i-1]|)
+
+        ER -> 1 means price moved directly from A to B (trending); ER -> 0
+        means it covered a lot of ground but ended up nowhere (choppy /
+        ranging). Returns "trending", "ranging", or "neutral" (between the
+        two thresholds, or not enough data — momentum/mean-reversion keep
+        their configured weights unchanged).
+        """
+        cfg = self.cfg
+        data = self._data_cache.get(symbol)
+        if data is None or len(data) < cfg.regime_window + 1:
+            return "neutral"
+        try:
+            closes = data["close"].astype(float).values[-(cfg.regime_window + 1):]
+            net_change   = abs(closes[-1] - closes[0])
+            path_length  = float(np.sum(np.abs(np.diff(closes))))
+            if path_length < 1e-12:
+                return "neutral"
+            efficiency_ratio = net_change / path_length
+            if efficiency_ratio >= cfg.regime_trending_threshold:
+                return "trending"
+            if efficiency_ratio <= cfg.regime_ranging_threshold:
+                return "ranging"
+            return "neutral"
+        except Exception as exc:
+            logger.debug("[%s] Regime detection failed: %s", symbol, exc)
+            return "neutral"
+
+    def _apply_regime_weighting(self, symbol: str) -> None:
+        """Reweight momentum vs mean-reversion for this symbol's upcoming
+        aggregation based on the detected regime. Always scales from the
+        ORIGINAL registered weight (self._strategy_base_weights), never
+        from the aggregator's current weight — otherwise the adjustment
+        would compound cycle over cycle instead of resetting each time.
+
+        SignalAggregator is a single instance shared across all symbols in
+        one cycle sweep, so this must run immediately before aggregating
+        THIS symbol's signals, not once per full sweep.
+        """
+        if not self.cfg.regime_enabled or not self._strategy_base_weights:
+            return
+        regime = self._detect_regime(symbol)
+        self._last_regime[symbol] = regime
+
+        for name, base_weight in self._strategy_base_weights.items():
+            mult = 1.0
+            if regime == "trending":
+                if name in self._REGIME_TREND_FAVORED:
+                    mult = self.cfg.regime_weight_boost
+                elif name in self._REGIME_RANGE_FAVORED:
+                    mult = self.cfg.regime_weight_cut
+            elif regime == "ranging":
+                if name in self._REGIME_RANGE_FAVORED:
+                    mult = self.cfg.regime_weight_boost
+                elif name in self._REGIME_TREND_FAVORED:
+                    mult = self.cfg.regime_weight_cut
+            self._aggregator.set_weight(name, base_weight * mult)
+
+        if self.cfg.verbose_signals:
+            logger.info("    Regime(%s) = %s", symbol, regime)
+
     def _resolve_fetch_bars(
         self,
         *,
@@ -1077,9 +1245,33 @@ class LiveTrader:
         direction   = 1 if decision.signal == SignalType.BUY else -1
 
         # Initial volatility-based size: risk a fixed fraction of equity per
-        # ATR-based stop distance. The RiskEngine re-caps this in Layer 4.
-        risk_cfg    = self._risk_engine.config
-        risk_amount = equity * risk_cfg.risk_per_trade_pct
+        # ATR-based stop distance, scaled by how convinced the aggregated
+        # signal actually is. Previously every trade that cleared the
+        # min_confidence gate got the exact same size whether it barely
+        # passed (0.46) or was near-certain (0.95) — a real trader risks
+        # more on their best setups, not a flat amount on every one that
+        # merely qualifies. Maps confidence linearly from min_confidence
+        # (0.5x risk) to 1.0 (1.0x risk); never below 0.5x since anything
+        # under min_confidence was already filtered out before this point.
+        # The RiskEngine re-caps this in Layer 4 regardless.
+        risk_cfg       = self._risk_engine.config
+        conf_range     = max(1.0 - self.cfg.min_confidence, 1e-6)
+        conviction_mult = 0.5 + 0.5 * float(np.clip(
+            (decision.confidence - self.cfg.min_confidence) / conf_range, 0.0, 1.0,
+        ))
+
+        # Taper size down after consecutive losses instead of trading full
+        # size right up until the hard kill-switch (max_consecutive_losses,
+        # default 6) trips and cuts to zero. A trader who just lost 3 in a
+        # row doesn't keep betting the same amount on the 4th — they scale
+        # down, then scale back up once a win resets the streak (resets to
+        # 0 in _reconcile_closed_trades on any winning trade). Floors at 0.4x
+        # rather than reaching zero — the kill-switch, not this taper, is
+        # what actually halts trading.
+        consecutive_losses = self._portfolio_state.consecutive_losses
+        loss_streak_mult   = max(0.4, 1.0 - 0.15 * consecutive_losses)
+
+        risk_amount = equity * risk_cfg.risk_per_trade_pct * conviction_mult * loss_streak_mult
         sl_distance = max(atr_proxy * self.cfg.sl_atr_multiplier, 1e-9)
         tp_distance = max(atr_proxy * self.cfg.tp_atr_multiplier, 1e-9)
         size        = round(risk_amount / sl_distance, 2)
@@ -1164,10 +1356,11 @@ class LiveTrader:
 
                 if result.status == ExecutionStatus.FILLED:
                     logger.info(
-                        "\u2713 FILLED %s | ticket=%s | price=%.5f | size=%.2f",
+                        "\u2713 FILLED %s | ticket=%s | price=%.5f | lots=%.2f (sized %.0f units)",
                         approved_order.symbol,
                         result.ticket,
                         result.fill_price,
+                        result.volume,
                         approved_order.size,
                     )
                     # Track this trade so its realized PnL can be recorded
@@ -1220,6 +1413,7 @@ class LiveTrader:
         engine sees a fake 90% daily loss and trips the kill switch.
         """
         try:
+            self._exec_engine.ensure_connected()
             account = self._exec_engine.get_account_info()
             if not account:
                 return
@@ -1292,6 +1486,39 @@ class LiveTrader:
                             {k: round(v, 0) for k, v in result.allocations.items()})
         except Exception as exc:
             logger.warning("Rebalance failed: %s", exc)
+
+    def _update_returns_matrix(self) -> None:
+        """Rebuild the cross-symbol returns matrix RiskEngine Layer 5
+        (correlation risk) reads from PortfolioState.
+
+        Previously nothing ever set this — RiskEngine._check_correlation()
+        early-returns APPROVE whenever returns_matrix is None, so the
+        correlation layer was permanently a no-op in live trading: with
+        several correlated pairs open at once (e.g. EURUSD + GBPUSD +
+        EURJPY, all sharing EUR/USD/GBP exposure), the risk engine never
+        noticed they were effectively one concentrated bet.
+
+        Uses the OHLCV already cached per symbol this cycle (_fetch_data) —
+        no extra MT5 calls. One cycle stale by design: this cycle's own
+        risk evaluations already ran per-symbol before the full sweep
+        finishes, so the refreshed matrix takes effect from next cycle.
+        """
+        if len(self._data_cache) < 2:
+            return
+        try:
+            returns: dict[str, pd.Series] = {}
+            for symbol, df in self._data_cache.items():
+                if df is None or len(df) < 20 or "close" not in df.columns:
+                    continue
+                returns[symbol] = df["close"].astype(float).pct_change().tail(100)
+            if len(returns) < 2:
+                return
+            matrix = pd.DataFrame(returns).dropna(how="all")
+            if matrix.empty:
+                return
+            self._portfolio_state.returns_matrix = matrix
+        except Exception as exc:
+            logger.debug("Returns matrix update failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Open position helpers
@@ -1368,10 +1595,11 @@ class LiveTrader:
                 self._open_trades[ticket] = info
                 continue
 
-            pnl        = float(res.get("pnl", 0.0))
-            exit_price = float(res.get("exit_price", 0.0))
-            ts         = datetime.now(timezone.utc)
-            duration_s = int((ts - info["entry_ts"]).total_seconds())
+            pnl         = float(res.get("pnl", 0.0))
+            exit_price  = float(res.get("exit_price", 0.0))
+            exit_reason = res.get("exit_reason", "closed")
+            ts          = datetime.now(timezone.utc)
+            duration_s  = int((ts - info["entry_ts"]).total_seconds())
 
             # Update kill-switch counter and FTMO profit trackers.
             with self._state_lock:
@@ -1410,7 +1638,7 @@ class LiveTrader:
                         exit_price  = exit_price,
                         pnl         = pnl,
                         duration_s  = duration_s,
-                        exit_reason = "closed",
+                        exit_reason = exit_reason,
                         ticket      = str(ticket),
                     )
                 except Exception as exc:
@@ -1441,7 +1669,7 @@ class LiveTrader:
                     "outcome":     outcome,
                     "confidence":  info.get("confidence"),
                     "strategies":  info["strategies"],
-                    "exit_reason": "closed",
+                    "exit_reason": exit_reason,
                     "features":    info.get("features") or {},
                 })
 

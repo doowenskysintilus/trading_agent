@@ -27,7 +27,6 @@ logger = logging.getLogger(__name__)
 try:
     import joblib
     from sklearn.ensemble import GradientBoostingClassifier
-    from sklearn.model_selection import train_test_split
     from sklearn.metrics import accuracy_score, roc_auc_score
     _SKLEARN_OK = True
 except ImportError:
@@ -48,6 +47,12 @@ class TrainReport:
     message:      str           = ""
     warning:      str           = ""
     reliable:     bool          = True
+    # Promotion gate: whether this newly fitted candidate replaced the
+    # deployed model. False means training succeeded but the candidate did
+    # not beat the currently deployed model on the same holdout, so the
+    # old model file (and in-memory state) was left untouched.
+    promoted:     bool          = True
+    deployed_auc: Optional[float] = None  # AUC of the model that stayed live
 
     def as_dict(self) -> dict:
         return {
@@ -61,6 +66,8 @@ class TrainReport:
             "message":       self.message,
             "warning":       self.warning,
             "reliable":      self.reliable,
+            "promoted":      self.promoted,
+            "deployed_auc":  round(self.deployed_auc, 4) if self.deployed_auc is not None else None,
         }
 
 
@@ -77,11 +84,22 @@ class WinClassifier:
     # Training
     # ------------------------------------------------------------------
 
-    def train(self, X, y, feature_names: list[str], min_samples: int = 30) -> TrainReport:
+    def train(
+        self,
+        X, y,
+        feature_names: list[str],
+        min_samples: int = 30,
+        promotion_tolerance: float = 0.02,
+    ) -> TrainReport:
         """Fit the classifier on (features → win) data.
 
         Requires at least ``min_samples`` trades and both classes present;
         otherwise returns an untrained report explaining why.
+
+        The freshly fitted candidate is only saved (promoted) if it beats
+        the currently deployed model's AUC on the same holdout, within
+        ``promotion_tolerance`` — otherwise the deployed model is left in
+        place and the rejection is reported (see TrainReport.promoted).
         """
         if not _SKLEARN_OK:
             return TrainReport(message="scikit-learn not installed.")
@@ -160,21 +178,76 @@ class WinClassifier:
 
         warning = "; ".join(warning_parts)
 
-        self._model = model
-        self._feature_names = list(feature_names)
-        self._reliable = reliable
-        self._save()
+        # ---- Promotion gate ---------------------------------------------
+        # Retraining used to overwrite the deployed model unconditionally,
+        # even when the new fit was worse (e.g. a bad batch of recent
+        # trades). Compare the candidate against whatever is currently
+        # deployed on the SAME holdout before promoting it.
+        deployed_auc = self._evaluate_deployed(X_te, y_te, feature_names)
+        promoted = deployed_auc is None or auc >= deployed_auc - promotion_tolerance
 
-        logger.info(
-            "WinClassifier trained — n=%d acc=%.3f auc=%.3f", n, acc, auc,
-        )
+        if promoted:
+            self._model = model
+            self._feature_names = list(feature_names)
+            self._reliable = reliable
+            self._save()
+            logger.info(
+                "WinClassifier trained & promoted — n=%d acc=%.3f auc=%.3f"
+                + (f" (deployed was auc=%.3f)" % deployed_auc if deployed_auc is not None else ""),
+                n, acc, auc,
+            )
+            message = "Model trained and saved."
+        else:
+            logger.warning(
+                "WinClassifier candidate REJECTED — candidate auc=%.3f < "
+                "deployed auc=%.3f - tolerance %.3f. Keeping deployed model.",
+                auc, deployed_auc, promotion_tolerance,
+            )
+            message = (
+                f"Candidate auc={auc:.3f} did not beat deployed model "
+                f"auc={deployed_auc:.3f} (tolerance {promotion_tolerance:.3f}) "
+                f"— kept the currently deployed model."
+            )
+
         return TrainReport(
             trained=True, n_samples=n, n_wins=n_wins, n_losses=n_losses,
-            accuracy=acc, auc=auc, feature_names=self._feature_names,
-            message="Model trained and saved.",
+            accuracy=acc, auc=auc, feature_names=list(feature_names),
+            message=message,
             warning=warning,
             reliable=reliable,
+            promoted=promoted,
+            deployed_auc=deployed_auc,
         )
+
+    def _evaluate_deployed(
+        self, X_te, y_te, candidate_feature_names: list[str],
+    ) -> Optional[float]:
+        """AUC of the currently deployed model (if any) on this holdout.
+
+        Loads the deployed model into a scratch instance so the live
+        in-memory model isn't disturbed by the comparison. Returns None
+        (no baseline to beat — candidate always promoted) when there is no
+        deployed model yet, it fails to load, or its feature set no longer
+        matches the candidate's (a fresh WinClassifier instance, the normal
+        call pattern from RetrainService, has no in-memory feature names of
+        its own to compare against — the candidate's own feature list is
+        the right baseline).
+        """
+        if not self.model_path.exists():
+            return None
+        scratch = WinClassifier(model_path=str(self.model_path))
+        if not scratch.load() or scratch._model is None:
+            return None
+        if list(scratch._feature_names) != list(candidate_feature_names):
+            # Feature set changed since the deployed model was trained —
+            # not a fair comparison, let the candidate through.
+            return None
+        try:
+            proba = scratch._model.predict_proba(X_te)[:, 1]
+            return float(roc_auc_score(y_te, proba))
+        except Exception as exc:
+            logger.debug("Could not evaluate deployed model for promotion gate: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Inference

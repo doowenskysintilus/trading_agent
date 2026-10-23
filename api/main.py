@@ -28,17 +28,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 try:
     from fastapi import (
-        BackgroundTasks, Depends, FastAPI, HTTPException,
-        Path, Query, Request, Security, status,
+        BackgroundTasks, FastAPI, HTTPException,
+        Path, Query, Request,
         WebSocket, WebSocketDisconnect,
     )
     from fastapi.middleware.cors import CORSMiddleware
@@ -51,23 +50,15 @@ except ImportError:
 
 from api.auth         import Auth, configure as _configure_auth
 from api.schemas      import (
-    APIResponse, ok, err,
+    ok, err,
     TradingStartRequest, TradingStopRequest, EmergencyStopRequest,
-    PortfolioStatusResponse, EquityPoint,
-    StrategyPerformanceResponse, StrategyToggleRequest,
-    BacktestRequest, BacktestJobResponse, BacktestResultResponse,
-    BacktestStrategyMetrics, BacktestJobStatus,
-    ManualTradeRequest, ClosePositionRequest, TradeExecutionResponse,
+    BacktestRequest, BacktestJobStatus,
+    ManualTradeRequest, ClosePositionRequest,
     TradeDirection,
-    RiskStatusResponse, RiskConfigUpdate, DrawdownPeriod,
+    RiskConfigUpdate,
     RetrainRequest,
-    EconomicEventResponse, CalendarEventsResponse,
 )
-from api.dependencies import (
-    AppState, BacktestJob,
-    get_app_state, require_trader, require_monitor,
-    require_execution, require_backtest,
-)
+from api.dependencies import AppState, BacktestJob, get_app_state
 from research.feature_store.calendar_provider import CalendarProvider, EventImportance
 
 
@@ -275,9 +266,7 @@ def create_app(
             return ok({"message": "Trader is already running."})
 
         try:
-            import os
             from live_trading.live_trader import LiveTrader, LiveTraderConfig
-            from engines.execution_engine.execution_engine import ExecutionConfig
             from engines.portfolio_engine.portfolio_engine import AllocationMethod
             from config.settings import settings
 
@@ -302,6 +291,8 @@ def create_app(
                 ml_min_win_proba       = body.ml_min_win_proba,
                 sl_atr_multiplier      = body.sl_atr_multiplier,
                 tp_atr_multiplier      = body.tp_atr_multiplier,
+                ftmo_enabled           = body.ftmo_enabled,
+                ftmo_initial_balance   = body.ftmo_initial_balance,
                 # MT5 credentials sourced from .env (optional — an
                 # already-logged-in terminal works without them).
                 mt5_login    = settings.mt5.login,
@@ -415,6 +406,7 @@ def create_app(
         Runs in the background; poll GET /rl/status for progress/results.
         """
         from research.training.retrain_service import RetrainService
+        from config.settings import settings as _cfg
 
         svc = getattr(_state, "retrain_service", None)
         if svc is None:
@@ -528,9 +520,7 @@ def create_app(
         markers + an equity curve.
         """
         from pathlib import Path as _Path
-        from strategies.rl_agent.rl_trainer import (
-            RLTrainerConfig, RLTradingEnv, replay_episode,
-        )
+        from strategies.rl_agent.rl_trainer import RLTrainerConfig, replay_episode
 
         bars = max(64, min(int(bars), 20_000))
 
@@ -1231,7 +1221,19 @@ def create_app(
             except Exception:
                 pass
 
-            _state.attach_monitor(TradingMonitor(config=mon_cfg))
+            monitor = TradingMonitor(config=mon_cfg)
+
+            if settings.alerts.telegram_enabled:
+                from monitoring.alerts import TelegramAlertSender
+                monitor.register_alert(
+                    TelegramAlertSender(
+                        settings.alerts.telegram_bot_token,
+                        settings.alerts.telegram_chat_id,
+                    ).send
+                )
+                logger.info("Telegram alerting enabled.")
+
+            _state.attach_monitor(monitor)
             logger.info("TradingMonitor attached.")
         except Exception as exc:
             logger.warning("Could not attach monitor: %s", exc)

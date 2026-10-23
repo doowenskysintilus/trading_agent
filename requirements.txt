@@ -26,6 +26,7 @@ fastapi>=0.111.0
 uvicorn[standard]>=0.29.0   # ASGI server with WebSocket support
 pydantic>=2.6.0
 python-dotenv>=1.0.0        # Loads .env configuration (config/settings.py)
+requests>=2.31.0            # Trading Economics + FRED calendar APIs, Telegram alerts
 
 # ── Database ────────────────────────────────────────────────────────────────
 mysql-connector-python>=8.4.0   # Primary metrics store (monitoring/metrics_store.py)

@@ -55,7 +55,7 @@ Usage with standard SB3 PPO (feature extractor mode)
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Type
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -63,7 +63,6 @@ import torch.nn as nn
 
 try:
     from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-    from stable_baselines3.common.policies import ActorCriticPolicy
     import gymnasium as gym
     _SB3_AVAILABLE = True
 except ImportError:
@@ -164,105 +163,6 @@ class LSTMCore(nn.Module):
         out, hidden = self.lstm(x, hidden)
         last = out[:, -1, :]            # last timestep
         return self.norm(last), hidden
-
-
-# ---------------------------------------------------------------------------
-# Full actor-critic network
-# ---------------------------------------------------------------------------
-
-class LSTMActorCriticNet(nn.Module):
-    """
-    Combined actor-critic network with shared LSTM backbone.
-
-    Actor  → Categorical distribution over {HOLD, BUY, SELL}
-    Critic → Scalar state value V(s)
-
-    Parameters
-    ----------
-    obs_dim      : int    flat observation size
-    n_actions    : int    3 for trading (HOLD / BUY / SELL)
-    encoder_dim  : int    encoder hidden size
-    lstm_hidden  : int    LSTM hidden size
-    n_lstm_layers: int
-    head_hidden  : int    actor/critic head hidden size
-    dropout      : float
-    """
-
-    def __init__(
-        self,
-        obs_dim: int,
-        n_actions: int       = 3,
-        encoder_dim: int     = 128,
-        lstm_hidden: int     = 256,
-        n_lstm_layers: int   = 2,
-        head_hidden: int     = 64,
-        dropout: float       = 0.1,
-    ) -> None:
-        super().__init__()
-
-        self.encoder = InputEncoder(obs_dim, encoder_dim, dropout)
-        self.lstm    = LSTMCore(encoder_dim, lstm_hidden, n_lstm_layers, dropout)
-
-        self.actor_head = nn.Sequential(
-            nn.Linear(lstm_hidden, head_hidden),
-            nn.GELU(),
-            nn.Linear(head_hidden, n_actions),
-        )
-        self.critic_head = nn.Sequential(
-            nn.Linear(lstm_hidden, head_hidden),
-            nn.GELU(),
-            nn.Linear(head_hidden, 1),
-        )
-
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                nn.init.zeros_(m.bias)
-        # Actor head: small init for better initial exploration
-        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
-
-    def forward(
-        self,
-        obs: torch.Tensor,
-        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Returns
-        -------
-        action_logits : (batch, n_actions)
-        value         : (batch, 1)
-        hidden        : updated LSTM state
-        """
-        # obs shape: (batch, obs_dim) → add seq_len=1 for LSTM
-        encoded = self.encoder(obs)              # (batch, encoder_dim)
-        encoded = encoded.unsqueeze(1)           # (batch, 1, encoder_dim)
-
-        lstm_out, hidden = self.lstm(encoded, hidden)  # (batch, lstm_hidden)
-
-        action_logits = self.actor_head(lstm_out)      # (batch, n_actions)
-        value         = self.critic_head(lstm_out)     # (batch, 1)
-
-        return action_logits, value, hidden
-
-    def get_action_probs(
-        self,
-        obs: torch.Tensor,
-        hidden: Optional[Tuple] = None,
-    ) -> Tuple[torch.Tensor, Tuple]:
-        """Return action probabilities (softmax) and updated hidden state."""
-        logits, _, hidden = self.forward(obs, hidden)
-        return torch.softmax(logits, dim=-1), hidden
-
-    def get_value(
-        self,
-        obs: torch.Tensor,
-        hidden: Optional[Tuple] = None,
-    ) -> torch.Tensor:
-        _, value, _ = self.forward(obs, hidden)
-        return value
 
 
 # ---------------------------------------------------------------------------

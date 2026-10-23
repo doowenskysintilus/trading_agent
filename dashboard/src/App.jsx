@@ -7,6 +7,7 @@ import TradesFeed         from './components/TradesFeed.jsx'
 import EconomicCalendar   from './components/EconomicCalendar.jsx'
 import TradingControls    from './components/TradingControls.jsx'
 import RetrainControls    from './components/RetrainControls.jsx'
+import AccountSwitcher    from './components/AccountSwitcher.jsx'
 import useWebSocket       from './hooks/useWebSocket.js'
 import { AUTH_HEADERS, WS_URL, buildApiPath } from './apiConfig.js'
 
@@ -223,6 +224,7 @@ export default function App() {
         </div>
 
         <div className="header-right">
+          <AccountSwitcher />
           <TradingControls running={running} emergency={emergency} />
           <WsStatusBadge status={status} />
           {alerts.length > 0 && (

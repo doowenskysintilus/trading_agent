@@ -19,11 +19,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional
-
-import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -321,11 +319,6 @@ class DataFeed:
             "currency_base":   info.currency_base,
             "currency_profit": info.currency_profit,
         }
-
-    def validate_symbol(self, symbol: str) -> bool:
-        """Return True if the symbol is tradeable."""
-        info = self.get_symbol_info(symbol)
-        return info is not None and info.get("trade_mode", 0) != 0
 
     # ------------------------------------------------------------------
     # Streaming

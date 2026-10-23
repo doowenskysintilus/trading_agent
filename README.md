@@ -60,8 +60,7 @@ quant-fund-ai/
 │
 ├── monitoring/                  # Observability layer
 │   ├── monitor.py               # TradingMonitor — LiveTrader hook
-│   ├── metrics_store.py         # MySQL + JSONL dual-write persistence
-│   └── api.py                   # Monitoring-only FastAPI sub-app
+│   └── metrics_store.py         # MySQL + JSONL dual-write persistence
 │
 ├── live_trading/                # Live execution
 │   ├── live_trader.py           # 8-stage trading loop orchestrator
@@ -69,7 +68,6 @@ quant-fund-ai/
 │
 ├── engines/
 │   ├── signal_engine/
-│   │   ├── signal_engine.py     # Weighted signal voting
 │   │   └── signal_aggregator.py # PerformanceWeighter + ConflictResolver
 │   ├── risk_engine/
 │   │   └── risk_engine.py       # 6-layer risk evaluation
@@ -86,7 +84,7 @@ quant-fund-ai/
 │   ├── rl_agent/
 │   │   ├── rl_alpha.py          # Inference wrapper (stateful LSTM)
 │   │   ├── rl_trainer.py        # PPO-LSTM training pipeline
-│   │   └── ppo_lstm_policy.py   # Custom LSTM actor-critic architecture
+│   │   └── ppo_lstm_policy.py   # LSTM feature extractor + policy kwargs
 │   └── ensemble/                # (planned) Combined strategy
 │
 ├── backtesting/

@@ -23,6 +23,8 @@ env/
 .env.*
 *.key
 secrets/
+accounts.json
+dashboard/src/accounts.local.js
 
 # ── Data / Models ─────────────────────────────────────────────────────────────
 data/storage/logs/
