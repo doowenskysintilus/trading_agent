@@ -580,6 +580,9 @@ body {
   display:       flex;
   flex-direction: column;
   gap:           12px;
+  /* Long form: scroll inside the popover instead of running off-screen. */
+  max-height:    calc(100vh - 80px);
+  overflow-y:    auto;
 }
 .tc-popover-head {
   display:         flex;

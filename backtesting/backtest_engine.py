@@ -64,6 +64,10 @@ class BacktestConfig:
     spread: float          = 0.0001    # half-spread in price units
     slippage_std: float    = 0.00005   # Gaussian noise std
     commission: float      = 0.0002    # fraction of notional per trade
+    # Price of one MT5 spread point (symbol_info.point). When > 0 and the
+    # data has a `spread` column (MT5 points, per bar), each fill pays that
+    # bar's real half-spread instead of the fixed `spread` (SCALPING VA-01).
+    spread_point: float    = 0.0
 
     # ---- Position sizing -------------------------------------------------
     initial_balance: float = 100_000.0
@@ -235,7 +239,7 @@ class _StrategySim:
         if self.position:
             self._close(bar, price, "signal")
 
-        exec_price = self._execution_price(price, direction)
+        exec_price = self._execution_price(price, direction, bar)
         notional   = self.equity * self.cfg.position_size_pct
         size       = notional / (exec_price + 1e-10)
         commission = notional * self.cfg.commission
@@ -260,7 +264,7 @@ class _StrategySim:
 
     def _close(self, bar: int, price: float, reason: str) -> None:
         pos        = self.position
-        exec_price = self._execution_price(price, -pos.direction)
+        exec_price = self._execution_price(price, -pos.direction, bar)
         commission = exec_price * pos.size * self.cfg.commission
         raw_pnl    = (exec_price - pos.entry_price) * pos.direction * pos.size
         net_pnl    = raw_pnl - commission
@@ -305,10 +309,14 @@ class _StrategySim:
         if self.equity > self.peak_equity:
             self.peak_equity = self.equity
 
-    def _execution_price(self, price: float, direction: int) -> float:
+    def _execution_price(self, price: float, direction: int, bar: int) -> float:
         slippage = float(self.rng.normal(0, self.cfg.slippage_std))
-        spread   = self.cfg.spread * direction
-        return price + spread + slippage
+        return price + self._half_spread(bar) * direction + slippage
+
+    def _half_spread(self, bar: int) -> float:
+        if self.cfg.spread_point > 0 and "spread" in self.data.columns:
+            return float(self.data.at[bar, "spread"]) * self.cfg.spread_point / 2.0
+        return self.cfg.spread
 
 
 # ---------------------------------------------------------------------------

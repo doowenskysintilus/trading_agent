@@ -119,6 +119,13 @@ class ExecutionConfig:
 
     # Slippage guard (independent of MT5 deviation)
     max_slippage_pct: float   = 0.0010    # 0.10 % of price
+    # When > 0, the MT5 deviation is set per order to this many times the
+    # symbol's current spread instead of deviation_points (scalping EX-07).
+    deviation_spread_mult: float = 0.0
+    # Refuse orders whose size is below the broker's volume_min instead of
+    # rounding them UP to volume_min — rounding up silently increases the
+    # risk taken (scalping SZ-06).
+    reject_below_min_volume: bool = False
 
     # Trailing stop
     trailing_step_pct: float  = 0.0005   # move SL every 0.05 % of price
@@ -407,7 +414,8 @@ class MT5ExecutionEngine:
         if volume <= 0:
             return ExecutionResult(
                 status=ExecutionStatus.REJECTED,
-                message=f"Normalized volume is 0 for {trade.symbol} — no symbol info / broker limits unavailable.",
+                message=(f"Volume for {trade.symbol} is 0 after normalisation — below the "
+                         f"broker's volume_min, or symbol info unavailable."),
             )
 
         request = {
@@ -418,7 +426,7 @@ class MT5ExecutionEngine:
             "price":      price,
             "sl":         sl,
             "tp":         tp,
-            "deviation":  self.config.deviation_points,
+            "deviation":  self._deviation_points(trade.symbol),
             "magic":      self.config.magic_number,
             "comment":    self.config.comment,
             "type_time":  mt5.ORDER_TIME_GTC,
@@ -479,6 +487,42 @@ class MT5ExecutionEngine:
             self.trailing.untrack(pos.ticket)
 
         return result
+
+    def modify_position_sl(self, ticket: int, symbol: str, sl: float, tp: float) -> bool:
+        """Move the stop-loss of an open position (TP unchanged if passed as is)."""
+        if not self._connected or not _MT5_AVAILABLE:
+            return False
+        info = mt5.symbol_info(symbol)
+        digits = getattr(info, "digits", 5) if info else 5
+        res = mt5.order_send({
+            "action":   mt5.TRADE_ACTION_SLTP,
+            "symbol":   symbol,
+            "position": ticket,
+            "sl":       round(sl, digits),
+            "tp":       tp,
+        })
+        ok = bool(res and res.retcode in _SUCCESS_CODES)
+        if not ok:
+            logger.warning("SL modify failed: ticket=%d retcode=%s",
+                           ticket, res.retcode if res else "None")
+        return ok
+
+    def get_symbol_snapshot(self, symbol: str) -> Optional[dict]:
+        """Live quote + symbol properties used by the scalping rules."""
+        if not self._connected or not _MT5_AVAILABLE:
+            return None
+        tick = mt5.symbol_info_tick(symbol)
+        info = mt5.symbol_info(symbol)
+        if tick is None or info is None:
+            return None
+        return {
+            "bid":         float(tick.bid),
+            "ask":         float(tick.ask),
+            "time":        int(tick.time),          # broker clock, epoch seconds
+            "point":       float(info.point),
+            "volume_min":  float(getattr(info, "volume_min", 0.01) or 0.01),
+            "volume_step": float(getattr(info, "volume_step", 0.01) or 0.01),
+        }
 
     def apply_trailing_stops(self) -> int:
         """
@@ -567,6 +611,8 @@ class MT5ExecutionEngine:
             "free_margin": info.margin_free,
             "leverage": info.leverage,
             "currency": info.currency,
+            "server":   getattr(info, "server", ""),
+            "login":    getattr(info, "login", 0),
         }
 
     def get_closed_pnl(self, position_ticket: int) -> Optional[dict]:
@@ -625,6 +671,11 @@ class MT5ExecutionEngine:
         vol_max  = getattr(info, "volume_max", 100.0) or 100.0
         vol_step = getattr(info, "volume_step", 0.01) or 0.01
 
+        if self.config.reject_below_min_volume and lots < vol_min:
+            logger.info("%s: %.4f lots < volume_min %.2f — order refused (SZ-06).",
+                        symbol, lots, vol_min)
+            return 0.0
+
         lots = max(vol_min, min(lots, vol_max))
         # Round to the nearest allowed step (brokers reject volumes that
         # aren't an exact multiple of volume_step too).
@@ -633,6 +684,17 @@ class MT5ExecutionEngine:
         lots  = max(vol_min, min(lots, vol_max))
 
         return lots
+
+    def _deviation_points(self, symbol: str) -> int:
+        """Max price deviation accepted by MT5 for a market order, in points."""
+        mult = self.config.deviation_spread_mult
+        if mult <= 0:
+            return self.config.deviation_points
+        info = mt5.symbol_info(symbol)
+        spread = float(getattr(info, "spread", 0) or 0) if info else 0.0
+        if spread <= 0:
+            return self.config.deviation_points
+        return max(1, int(round(spread * mult)))
 
     def _resolve_filling_mode(self, symbol: str) -> int:
         """Return the correct ORDER_FILLING_* constant for a symbol.

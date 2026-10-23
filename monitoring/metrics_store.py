@@ -153,7 +153,48 @@ _DDL = [
         INDEX idx_start (start_ts)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """,
+    """
+    CREATE TABLE IF NOT EXISTS scalping_decisions (
+        id             BIGINT AUTO_INCREMENT PRIMARY KEY,
+        ts             DATETIME(3) NOT NULL,
+        symbol         VARCHAR(16) NOT NULL,
+        verdict        VARCHAR(16) NOT NULL,
+        rule_id        VARCHAR(24),
+        reason         VARCHAR(255),
+        direction      VARCHAR(8),
+        confidence     DOUBLE,
+        ml_win_proba   DOUBLE,
+        rl_action      VARCHAR(8),
+        regime         VARCHAR(16),
+        spread_points  DOUBLE,
+        atr            DOUBLE,
+        size_mult      DOUBLE,
+        ticket         VARCHAR(32),
+        rules_version  VARCHAR(16),
+        INDEX idx_ts      (ts),
+        INDEX idx_symbol  (symbol),
+        INDEX idx_verdict (verdict)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
 ]
+
+# Columns added to `trades` by the scalping rules (DB-02). Applied to
+# existing databases at connect time — CREATE TABLE IF NOT EXISTS never
+# alters a table that is already there.
+_TRADES_EXTRA_COLUMNS: dict[str, str] = {
+    "spread_at_entry": "DOUBLE",
+    "slippage":        "DOUBLE",
+    "ml_win_proba":    "DOUBLE",
+    "rl_action":       "VARCHAR(8)",
+    "regime":          "VARCHAR(16)",
+    "rules_version":   "VARCHAR(16)",
+}
+
+_DECISION_COLUMNS = (
+    "ts", "symbol", "verdict", "rule_id", "reason", "direction", "confidence",
+    "ml_win_proba", "rl_action", "regime", "spread_points", "atr", "size_mult",
+    "ticket", "rules_version",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +226,7 @@ class MetricsStore:
         self._pool      = None
         self._lock      = threading.Lock()
         self._connected = False
+        self._json_ok   = True   # last JSONL write succeeded
 
     # ------------------------------------------------------------------
     # Connection
@@ -222,6 +264,12 @@ class MetricsStore:
     def disconnect(self) -> None:
         self._connected = False
         self._pool = None
+
+    @property
+    def persistence_ok(self) -> bool:
+        """True while records can be persisted: MySQL connected, or the
+        JSONL fallback still writable (scalping rule DB-04)."""
+        return self._connected or self._json_ok
 
     def __enter__(self) -> "MetricsStore":
         self.connect()
@@ -299,7 +347,10 @@ class MetricsStore:
         duration_s:   int   = 0,
         exit_reason:  str   = "",
         ticket:       str   = "",
+        extra:        Optional[dict] = None,
     ) -> None:
+        """`extra` may carry the DB-02 columns (spread_at_entry, slippage,
+        ml_win_proba, rl_action, regime, rules_version); other keys are ignored."""
         pnl_pct = (exit_price - entry_price) / (entry_price + 1e-10)
         row = {
             "ts":           _fmt_ts(ts),
@@ -315,8 +366,51 @@ class MetricsStore:
             "exit_reason":  exit_reason,
             "ticket":       ticket,
         }
+        for key, value in (extra or {}).items():
+            if key in _TRADES_EXTRA_COLUMNS and value is not None:
+                row[key] = value
         self._json_append("trades", row)
         self._mysql_insert("trades", row)
+
+    # ------------------------------------------------------------------
+    # Write / query — scalping decisions (DB-01)
+    # ------------------------------------------------------------------
+
+    def write_decision(self, decision: dict) -> None:
+        row = {k: decision.get(k) for k in _DECISION_COLUMNS if decision.get(k) is not None}
+        ts = decision.get("ts")
+        row["ts"] = _fmt_ts(ts) if isinstance(ts, datetime) else _fmt_ts(datetime.now(timezone.utc))
+        if isinstance(row.get("reason"), str):
+            row["reason"] = row["reason"][:255]
+        self._json_append("decisions", row)
+        self._mysql_insert("scalping_decisions", row)
+
+    def query_decisions(
+        self,
+        symbol: Optional[str] = None,
+        verdict: Optional[str] = None,
+        start: Optional[datetime] = None,
+        limit: int = 200,
+    ) -> list[dict]:
+        if self._connected:
+            sql = "SELECT * FROM scalping_decisions"
+            params, where = [], []
+            if symbol:
+                where.append("symbol = %s"); params.append(symbol)
+            if verdict:
+                where.append("verdict = %s"); params.append(verdict)
+            if start:
+                where.append("ts >= %s"); params.append(_fmt_ts(start))
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += f" ORDER BY ts DESC LIMIT {int(limit)}"
+            rows = self._mysql_query(sql, params)
+            if rows is not None:
+                return rows
+        rows = self._json_query("decisions", start, None, limit)
+        return [r for r in rows
+                if (not symbol or r.get("symbol") == symbol)
+                and (not verdict or r.get("verdict") == verdict)]
 
     # ------------------------------------------------------------------
     # Write — risk snapshot
@@ -500,6 +594,15 @@ class MetricsStore:
             cursor = conn.cursor()
             for ddl in _DDL:
                 cursor.execute(ddl)
+            # MySQL has no "ADD COLUMN IF NOT EXISTS": add only what is missing.
+            cursor.execute(
+                "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'trades'"
+            )
+            existing = {r[0] for r in cursor.fetchall()}
+            for column, sql_type in _TRADES_EXTRA_COLUMNS.items():
+                if column not in existing:
+                    cursor.execute(f"ALTER TABLE trades ADD COLUMN `{column}` {sql_type}")
             conn.commit()
 
     def _mysql_insert(self, table: str, row: dict) -> None:
@@ -545,12 +648,14 @@ class MetricsStore:
         return dir_path / f"{category}.jsonl"
 
     def _json_append(self, category: str, row: dict) -> None:
-        path = self._json_path(category)
         try:
+            path = self._json_path(category)
             with self._lock:
                 with path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(row, default=str) + "\n")
+            self._json_ok = True
         except OSError as exc:
+            self._json_ok = False
             logger.error("JSON write failed (%s): %s", category, exc)
 
     def _json_query(

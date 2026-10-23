@@ -219,39 +219,41 @@ class CalendarProvider:
         list[EconomicEvent]
             Events for the pair's currencies
         """
-        # Extract relevant currencies from symbol
-        # EURUSD → [EUR, USD], GBPJPY → [GBP, JPY]
+        return self.get_upcoming_events(
+            next_n_hours, self._symbol_countries(symbol), min_importance,
+        )
+
+    def _symbol_countries(self, symbol: str) -> list[str]:
+        """Currencies of a trading pair: EURUSD → [EUR, USD], GBPJPY → [GBP, JPY]."""
         base_curr = symbol[:3].upper() if len(symbol) >= 3 else ""
         quote_curr = symbol[3:6].upper() if len(symbol) >= 6 else ""
-        
+
         countries = []
         if base_curr in self._SYMBOL_CURRENCIES.values():
             countries.append(base_curr)
         if quote_curr in self._SYMBOL_CURRENCIES.values() and quote_curr not in countries:
             countries.append(quote_curr)
-        
+
         if not countries:
             # Fallback: look up in mapping
             countries = [self._SYMBOL_CURRENCIES.get(symbol, "USD")]
-        
-        return self.get_upcoming_events(next_n_hours, countries, min_importance)
-    
+        return countries
+
     def event_is_active(
         self,
         symbol: str,
         window_minutes: int = 30,
     ) -> bool:
-        """Check if a high-importance event is happening now for this symbol."""
-        events = self.get_events_for_symbol(
-            symbol,
-            next_n_hours=0.5,  # Look 30 min ahead
-            min_importance=EventImportance.HIGH,
+        """True if a HIGH-importance event for this symbol's currencies is
+        within ±window_minutes of now — before AND after the release
+        (the upcoming-events helpers only see the future)."""
+        countries = self._symbol_countries(symbol)
+        return any(
+            e.country in countries
+            and e.importance.value >= EventImportance.HIGH.value
+            and e.is_active(window_minutes)
+            for e in self._fetch_events()
         )
-        now = datetime.now(timezone.utc)
-        for event in events:
-            if event.is_active(window_minutes):
-                return True
-        return False
     
     def hours_until_next_event(
         self,

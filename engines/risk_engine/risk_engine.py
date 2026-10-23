@@ -481,7 +481,19 @@ class RiskEngine:
             },
         )
 
-    # ------------------------------------------------------------------    # Layer 0 — Economic Event Blackout
+    def check_halt(self, portfolio_state: PortfolioState) -> Optional[RiskCheckResult]:
+        """Run only the portfolio-wide stop layers (1 kill switch, 1b FTMO,
+        2 drawdown) without any trade. Returns the first failing check, or
+        None when trading may continue. Lets callers stop early, before
+        computing signals, with exactly the same limits."""
+        checks = [self._check_kill_switch(portfolio_state)]
+        if self.config.ftmo_enabled:
+            checks.append(self._check_ftmo_rules(portfolio_state))
+        checks.append(self._check_drawdown(portfolio_state))
+        return next((c for c in checks if not c.passed), None)
+
+    # ------------------------------------------------------------------
+    # Layer 0 — Economic Event Blackout
     # ------------------------------------------------------------------
 
     def _check_event_blackout(self, trade: TradeOrder) -> RiskCheckResult:

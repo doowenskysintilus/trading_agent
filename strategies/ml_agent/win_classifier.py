@@ -71,6 +71,14 @@ class TrainReport:
         }
 
 
+@dataclass(frozen=True)
+class WinPrediction:
+    """P(win) plus why it may be missing, so callers can tell "no model yet"
+    (status no_model / unreliable) from "wrong inputs" (feature_mismatch)."""
+    proba:  Optional[float]
+    status: str   # ok | no_model | unreliable | feature_mismatch | error
+
+
 class WinClassifier:
     """Predicts P(win) from a trade's entry features."""
 
@@ -90,11 +98,14 @@ class WinClassifier:
         feature_names: list[str],
         min_samples: int = 30,
         promotion_tolerance: float = 0.02,
+        min_reliable_auc: float = 0.0,
     ) -> TrainReport:
         """Fit the classifier on (features → win) data.
 
         Requires at least ``min_samples`` trades and both classes present;
-        otherwise returns an untrained report explaining why.
+        otherwise returns an untrained report explaining why. A model whose
+        holdout AUC is below ``min_reliable_auc`` is saved but flagged
+        unreliable, so live filtering falls back to reduced size.
 
         The freshly fitted candidate is only saved (promoted) if it beats
         the currently deployed model's AUC on the same holdout, within
@@ -169,6 +180,12 @@ class WinClassifier:
             reliable = False
             warning_parts.append(
                 "Overfit risk: very high metrics on a small dataset"
+            )
+
+        if auc < min_reliable_auc:
+            reliable = False
+            warning_parts.append(
+                f"AUC {auc:.3f} below the reliability threshold {min_reliable_auc:.2f}"
             )
 
         if n < 200:
@@ -260,18 +277,22 @@ class WinClassifier:
         doesn't match the model's training features, so a changed feature
         config never silently corrupts predictions.
         """
+        return self.predict(features).proba
+
+    def predict(self, features: dict[str, float]) -> WinPrediction:
+        """P(win) with the reason it is unavailable, if it is."""
         if self._model is None and not self.load():
-            return None
+            return WinPrediction(None, "no_model")
 
         if not self._reliable:
             logger.debug(
-                "WinClassifier: model trained on <60 samples — bypassing filter "
-                "to avoid overfit-based blocking. Collect more trade data."
+                "WinClassifier: model flagged unreliable (small sample or low "
+                "AUC) — not used as a filter. Collect more trade data."
             )
-            return None
+            return WinPrediction(None, "unreliable")
 
         if not self._feature_names:
-            return None
+            return WinPrediction(None, "no_model")
 
         incoming_keys = set(features.keys())
         trained_keys  = set(self._feature_names)
@@ -284,17 +305,17 @@ class WinClassifier:
                 len(missing),
                 next(iter(missing)),
             )
-            return None
+            return WinPrediction(None, "feature_mismatch")
 
         x = np.array(
             [[float(features.get(name, 0.0)) for name in self._feature_names]],
             dtype=np.float64,
         )
         try:
-            return float(self._model.predict_proba(x)[0, 1])
+            return WinPrediction(float(self._model.predict_proba(x)[0, 1]), "ok")
         except Exception as exc:
             logger.debug("WinClassifier predict failed: %s", exc)
-            return None
+            return WinPrediction(None, "error")
 
     # ------------------------------------------------------------------
     # Persistence

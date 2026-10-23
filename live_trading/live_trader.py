@@ -72,7 +72,8 @@ from research.alpha_models.base import AlphaModel, AlphaSignal, SignalType
 from research.feature_store.calendar_provider import CalendarProvider
 from research.feature_store.feature_engineer import FeatureConfig, FeatureEngineer
 from live_trading.experience_collector import ExperienceCollector, extract_observation
-from strategies.ml_agent.win_classifier import WinClassifier
+from live_trading.scalping import ScalpingController
+from strategies.ml_agent.win_classifier import WinClassifier, WinPrediction
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,7 @@ class CycleStatus(Enum):
     EMERGENCY        = auto()
     ERROR            = auto()
     BAR_ALREADY_TRADED = auto()   # same symbol already acted on this bar
+    RULE_BLOCKED     = auto()     # refused by a scalping rule (SCALPING_RULES.md)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +205,15 @@ class LiveTraderConfig:
     symbols:   list[str] = field(default_factory=lambda: ["EURUSD"])
     timeframe: str       = "H1"
     warmup_bars: int     = 200     # 0 => auto max MT5 bars for timeframe
+    # Analyse closed bars only (drop the still-forming candle). Forced on by
+    # the scalping profile (SCALPING_RULES.md MK-09).
+    closed_bars_only: bool = False
+
+    # ---- Scalping rule set (SCALPING_RULES.md) --------------------------
+    # When enabled, every entry / exit goes through the scalping RuleEngine
+    # and the scalping profile overrides sizing, SL/TP and thresholds.
+    scalping_enabled: bool = False
+    scalping: Optional[object] = None   # ScalpingSettings; None → settings.scalping
 
     # ---- Multi-timeframe trend filter -----------------------------------
     # Confirms each entry signal against the trend of a higher timeframe
@@ -430,6 +441,19 @@ class LiveTrader:
             if self.cfg.ftmo_initial_balance > 0:
                 self.cfg.risk_config.ftmo_initial_balance = self.cfg.ftmo_initial_balance
 
+        # Scalping profile must be applied before the sub-engines read the
+        # config (RiskEngine keeps a reference to risk_config).
+        self._scalp_settings = None
+        if self.cfg.scalping_enabled:
+            if self.cfg.scalping is None:
+                from config.settings import settings as _settings
+                self.cfg.scalping = _settings.scalping
+            self._scalp_settings = self.cfg.scalping
+            changes = ScalpingController.apply_profile(self.cfg, self._scalp_settings)
+            logger.info("Scalping profile %s applied — overrides: %s",
+                        self._scalp_settings.rules_version,
+                        {k: f"{a} → {b}" for k, (a, b) in changes.items()} or "none")
+
         # ---- Sub-engines ------------------------------------------------
         self._feature_eng  = FeatureEngineer(self.cfg.feature_config)
         self._aggregator   = SignalAggregator()
@@ -441,6 +465,7 @@ class LiveTrader:
         self._allocator    = PortfolioAllocator(
             total_capital   = self.cfg.initial_balance,
         )
+        scalp = self._scalp_settings
         self._exec_engine  = MT5ExecutionEngine(
             ExecutionConfig(
                 login        = self.cfg.mt5_login,
@@ -448,8 +473,21 @@ class LiveTrader:
                 server       = self.cfg.mt5_server,
                 mt5_path     = self.cfg.mt5_path,
                 magic_number = self.cfg.magic_number,
+                # EX-07 / SZ-06
+                deviation_spread_mult   = scalp.max_slippage_spreads if scalp else 0.0,
+                reject_below_min_volume = scalp is not None,
             )
         )
+        self._scalp: Optional[ScalpingController] = None
+        if scalp is not None:
+            self._scalp = ScalpingController(
+                scalp,
+                timeframe         = self.cfg.timeframe,
+                risk_engine       = self._risk_engine,
+                calendar_provider = self._calendar_provider,
+                exec_engine       = self._exec_engine,
+                sink_getter       = lambda: self._monitor,
+            )
 
         # ---- State -------------------------------------------------------
         self._portfolio_state = PortfolioState(
@@ -680,8 +718,11 @@ class LiveTrader:
             # ---- Rebalance allocations after all symbols ----------------
             self._rebalance_portfolio()
 
-            # ---- Update trailing stops ----------------------------------
-            self._update_trailing_stops()
+            # ---- Position management ------------------------------------
+            if self._scalp is not None:
+                self._manage_scalp_positions()   # EX-04..06, EX-08
+            else:
+                self._update_trailing_stops()
 
             # ---- Sleep until next interval boundary ---------------------
             elapsed  = time.monotonic() - cycle_start
@@ -807,6 +848,28 @@ class LiveTrader:
                 return result
             self._last_signal_bar[symbol] = current_bar_ts
 
+            # 1c. Scalping rules — stages 0–2 (halt, frequency, market) ----
+            # With a position already open on the symbol no new entry is
+            # possible (SC-04): signals are still computed, but only to
+            # decide an early exit on an opposite signal (EX-09).
+            scalp_ctx = None
+            exit_only = False
+            if self._scalp is not None:
+                self._scalp.restore_once()
+                scalp_ctx = self._scalp.build_context(
+                    symbol, data, self._portfolio_state,
+                    open_symbols = self._open_position_symbols(),
+                    atr          = self._get_atr_proxy(symbol),
+                )
+                exit_only = symbol in scalp_ctx.open_symbols
+                if not exit_only:
+                    pre = self._scalp.check_pre_signal(scalp_ctx)
+                    if not pre.passed:
+                        self._scalp.record(symbol, "REJECTED", ctx=scalp_ctx,
+                                           evaluation=pre, dedupe=True)
+                        result.status = CycleStatus.RULE_BLOCKED
+                        return result
+
             # 2. Compute features -----------------------------------------
             features = self._compute_features(data)
             result.n_features = features.shape[1]
@@ -842,7 +905,13 @@ class LiveTrader:
                     logger.info("    [%s] HOLD — strategies disagree / no setup", symbol)
                 result.status = CycleStatus.NO_SIGNAL
                 return result
-            if decision.confidence < self.cfg.min_confidence:
+            if exit_only:
+                self._scalp_exit_on_opposite_signal(symbol, decision, scalp_ctx)
+                result.status = CycleStatus.NO_SIGNAL
+                return result
+            # In scalping mode the confidence gate is ConfidenceRule (SG-02/04),
+            # which also journals the refusal.
+            if self._scalp is None and decision.confidence < self.cfg.min_confidence:
                 if self.cfg.verbose_signals:
                     logger.info(
                         "    [%s] %s skipped — confidence %.3f < min %.2f",
@@ -866,13 +935,44 @@ class LiveTrader:
                         "    [%s] HTF filter: %s entry vs %s trend \u2192 skip",
                         symbol, decision.signal.name, htf_trend.name,
                     )
+                    if self._scalp is not None:
+                        scalp_ctx.decision = decision
+                        self._scalp.record(
+                            symbol, "REJECTED", ctx=scalp_ctx, rule_id="SG-05",
+                            reason=f"{decision.signal.name} against {self.cfg.htf_timeframe} "
+                                   f"trend {htf_trend.name}",
+                        )
                     result.status = CycleStatus.NO_SIGNAL
                     return result
 
-            # 4c. ML win/loss confidence filter ---------------------------
+            # 4c. Scalping rules \u2014 stages 3\u20134 (signal vs regime, ML filter)
+            scalp_size_mult = 1.0
+            scalp_meta: dict = {}
+            if self._scalp is not None:
+                scalp_ctx.decision      = decision
+                scalp_ctx.regime        = self._last_regime.get(symbol) or self._detect_regime(symbol)
+                scalp_ctx.ml_prediction = self._ml_prediction(symbol, features)
+                rl_action = self._rl_action(signals)
+                post = self._scalp.check_signal(scalp_ctx)
+                if not post.passed:
+                    self._scalp.record(symbol, "REJECTED", ctx=scalp_ctx, evaluation=post,
+                                       extra={"rl_action": rl_action})
+                    failed_id = post.failed.rule_id if post.failed else ""
+                    result.status = (CycleStatus.ML_FILTERED if failed_id.startswith("ML")
+                                     else CycleStatus.RULE_BLOCKED)
+                    return result
+                scalp_size_mult = post.size_multiplier
+                scalp_meta = {
+                    "ml_win_proba": post.metrics.get("ml_win_proba"),
+                    "rl_action":    rl_action,
+                    "regime":       scalp_ctx.regime,
+                }
+
+            # 4d. ML win/loss confidence filter ---------------------------
             # The classifier learns from the system's own closed-trade results
             # and predicts P(win) for this entry. Skip trades it judges weak.
-            if self._win_clf is not None:
+            # (Scalping mode uses MLFilterRule above instead.)
+            if self._win_clf is not None and self._scalp is None:
                 self._maybe_reload_classifier()
                 obs = self._feature_snapshot.get(symbol)
                 if obs is None:
@@ -894,11 +994,35 @@ class LiveTrader:
 
             # 5. Apply risk engine ----------------------------------------
             trade_order  = self._build_trade_order(symbol, decision)
+
+            # 5a. Scalping rules — stage 5 (order: size, live price, R:R) --
+            if self._scalp is not None:
+                trade_order.size = round(trade_order.size * scalp_size_mult, 2)   # SZ-04
+                self._scalp.rebase_order(trade_order, scalp_ctx.snapshot)
+                scalp_ctx.order = trade_order
+                order_check = self._scalp.check_order(scalp_ctx)
+                if not order_check.passed:
+                    self._scalp.record(symbol, "REJECTED", ctx=scalp_ctx,
+                                       evaluation=order_check, extra=scalp_meta)
+                    result.status = CycleStatus.RULE_BLOCKED
+                    return result
+                scalp_meta.update({
+                    "entry_atr":       scalp_ctx.atr,
+                    "round_trip_cost": scalp_ctx.round_trip_cost,
+                    "spread_points":   (scalp_ctx.snapshot.spread_points
+                                        if scalp_ctx.snapshot else None),
+                    "size_mult":       scalp_size_mult,
+                })
+
             risk_decision = self._apply_risk(trade_order)
             result.risk_decision = risk_decision
             if risk_decision.verdict.name in ("BLOCK",):
                 result.status = CycleStatus.RISK_BLOCKED
                 logger.info("[%s] Risk BLOCK — %s", symbol, risk_decision.blocking_reasons)
+                if self._scalp is not None:
+                    self._scalp.record(symbol, "RISK_BLOCKED", ctx=scalp_ctx, rule_id="SZ-05",
+                                       reason=", ".join(risk_decision.blocking_reasons),
+                                       extra=scalp_meta)
                 return result
 
             # 6. Allocate capital -----------------------------------------
@@ -906,8 +1030,21 @@ class LiveTrader:
             result.allocation = allocation
 
             # 7. Execute trades -------------------------------------------
-            executions = self._execute_trade(decision, trade_order, risk_decision)
+            if self._scalp is None:
+                executions = self._execute_trade(decision, trade_order, risk_decision)
+            else:
+                executions = self._execute_trade(decision, trade_order, risk_decision,
+                                                 extra_meta=scalp_meta)
             result.executions = executions
+            if self._scalp is not None:
+                for ex in executions:
+                    if ex.is_filled:
+                        self._scalp.on_entry(symbol, datetime.now(timezone.utc))
+                        self._scalp.record(symbol, "EXECUTED", ctx=scalp_ctx, ticket=ex.ticket,
+                                           extra=scalp_meta)
+                    else:
+                        self._scalp.record(symbol, "EXEC_FAILED", ctx=scalp_ctx, rule_id="EX",
+                                           reason=ex.message or str(ex.status), extra=scalp_meta)
 
             # 8. Post-cycle updates ---------------------------------------
             self._post_cycle_update(symbol, decision, executions)
@@ -950,7 +1087,8 @@ class LiveTrader:
             rates = mt5.copy_rates_from_pos(
                 symbol,
                 _get_mt5_tf(self.cfg.timeframe),
-                0,                          # start from the most recent
+                # 0 = include the still-forming candle; 1 = closed bars only.
+                1 if self.cfg.closed_bars_only else 0,
                 n_bars,
             )
             if rates is None or len(rates) == 0:
@@ -1287,6 +1425,96 @@ class LiveTrader:
             take_profit = round(entry_price + direction * tp_distance, 5),
         )
 
+    # ------------------------------------------------------------------
+    # Scalping helpers
+    # ------------------------------------------------------------------
+
+    def _open_position_symbols(self) -> list[str]:
+        try:
+            return [p.symbol for p in self._exec_engine.get_open_positions()]
+        except Exception as exc:
+            logger.debug("Open positions unavailable: %s", exc)
+            return []
+
+    def _ml_prediction(self, symbol: str, features: pd.DataFrame) -> WinPrediction:
+        if self._win_clf is None:
+            return WinPrediction(None, "no_model")
+        self._maybe_reload_classifier()
+        obs = self._feature_snapshot.get(symbol) or extract_observation(features)
+        return self._win_clf.predict(obs)
+
+    @staticmethod
+    def _rl_action(signals: list[AlphaSignal]) -> Optional[str]:
+        """The RL agent's own vote this cycle (audit trail only)."""
+        for sig in signals:
+            if "rl" in (sig.strategy_name or "").lower():
+                return sig.signal.name
+        return None
+
+    def _scalp_exit_on_opposite_signal(self, symbol: str, decision, scalp_ctx) -> None:
+        """EX-09 — close our open position on this symbol when the aggregated
+        signal flips with at least the entry confidence."""
+        if decision.confidence < self.cfg.min_confidence:
+            return
+        direction = 1 if decision.signal == SignalType.BUY else -1
+        with self._state_lock:
+            tracked = dict(self._open_trades)
+        for pos in self._exec_engine.get_open_positions():
+            if pos.symbol != symbol or pos.ticket not in tracked or pos.direction == direction:
+                continue
+            res = self._exec_engine.close_position(symbol, pos.ticket)
+            scalp_ctx.decision = decision
+            if res.is_filled:
+                self._tag_exit(pos.ticket, "signal")
+            self._scalp.record(
+                symbol, "CLOSE" if res.is_filled else "CLOSE_FAILED", ctx=scalp_ctx,
+                rule_id="EX-09", ticket=pos.ticket,
+                reason=f"opposite {decision.signal.name} signal, conf {decision.confidence:.3f}",
+            )
+
+    _EXIT_LABELS = {"EX-04": "time_stop", "EX-08": "session_close",
+                    "EX-05": "breakeven", "EX-06": "trailing"}
+
+    def _tag_exit(self, ticket: int, label: str) -> None:
+        with self._state_lock:
+            if ticket in self._open_trades:
+                self._open_trades[ticket]["exit_reason_override"] = label
+
+    def _manage_scalp_positions(self) -> None:
+        """Apply the position rules (time stop, session close, breakeven,
+        ATR trailing) to the positions this trader opened."""
+        try:
+            positions = self._exec_engine.get_open_positions()
+        except Exception as exc:
+            logger.warning("Position management skipped: %s", exc)
+            return
+        with self._state_lock:
+            tracked = dict(self._open_trades)
+        by_ticket = {p.ticket: p for p in positions}
+        for action in self._scalp.manage(positions, tracked):
+            pos = by_ticket.get(action.ticket)
+            if pos is None:
+                continue
+            if action.kind == "close":
+                res = self._exec_engine.close_position(action.symbol, action.ticket)
+                if res.is_filled:
+                    self._tag_exit(action.ticket, self._EXIT_LABELS.get(action.rule_id, action.rule_id))
+                verdict = "CLOSE" if res.is_filled else "CLOSE_FAILED"
+            else:
+                ok = self._exec_engine.modify_position_sl(
+                    action.ticket, action.symbol, action.new_sl, pos.tp,
+                )
+                if ok:
+                    with self._state_lock:
+                        if action.ticket in self._open_trades:
+                            self._open_trades[action.ticket]["sl_rule"] = action.rule_id
+                verdict = "MODIFY_SL" if ok else "MODIFY_FAILED"
+            self._scalp.record(
+                action.symbol, verdict, rule_id=action.rule_id, ticket=action.ticket,
+                reason=action.reason + (f" → SL {action.new_sl:.5f}" if action.new_sl else ""),
+                extra={"direction": "BUY" if pos.direction > 0 else "SELL"},
+            )
+
     def _apply_risk(self, order: TradeOrder) -> RiskDecision:
         return self._risk_engine.evaluate_portfolio_risk(
             trades          = [order],
@@ -1343,7 +1571,10 @@ class LiveTrader:
         decision: AggregatedDecision,
         order: TradeOrder,
         risk_decision: RiskDecision,
+        extra_meta: Optional[dict] = None,
     ) -> list[ExecutionResult]:
+        """`extra_meta` is stored with each filled ticket (scalping: entry
+        ATR, costs, spread, ML / RL / regime context for the audit trail)."""
         results = []
         try:
             # The RiskEngine already applied any size reduction (REDUCE verdict)
@@ -1384,6 +1615,8 @@ class LiveTrader:
                         # experience collector is enabled).
                         "features":    self._feature_snapshot.get(approved_order.symbol)
                                        if self._experience is not None else None,
+                        "slippage_points": result.slippage_points,
+                        **(extra_meta or {}),
                     }
                 else:
                     logger.warning(
@@ -1424,6 +1657,8 @@ class LiveTrader:
             if bal is not None and bal > 0:
                 self._portfolio_state.balance = bal
 
+            self._maybe_enable_ftmo(account)
+
             # Track the running high-water mark for drawdown calculations.
             if eq is not None and eq > self._portfolio_state.peak_equity:
                 self._portfolio_state.peak_equity = eq
@@ -1446,6 +1681,27 @@ class LiveTrader:
                 )
         except Exception as exc:
             logger.debug("Account equity sync failed: %s", exc)
+
+    def _maybe_enable_ftmo(self, account: dict) -> None:
+        """FQ-09 — an FTMO account must run with the FTMO limits on. When
+        the broker server is an FTMO one and the limits are off, switch them
+        on, using the configured challenge balance or else the current one."""
+        if self._scalp is None or not self._scalp.cfg.ftmo_auto_detect:
+            return
+        rc = self.cfg.risk_config
+        if rc.ftmo_enabled or "FTMO" not in str(account.get("server", "")).upper():
+            return
+        initial = self.cfg.ftmo_initial_balance or float(account.get("balance") or 0.0)
+        if initial <= 0:
+            return
+        rc.ftmo_enabled = True
+        rc.ftmo_initial_balance = initial
+        self._portfolio_state.ftmo_initial_balance = initial
+        logger.warning(
+            "FQ-09: FTMO server detected (%s) — FTMO limits enabled with initial "
+            "balance %.2f. Set ftmo_initial_balance if the challenge started higher.",
+            account.get("server"), initial,
+        )
 
     def _post_cycle_update(
         self,
@@ -1600,6 +1856,12 @@ class LiveTrader:
             exit_reason = res.get("exit_reason", "closed")
             ts          = datetime.now(timezone.utc)
             duration_s  = int((ts - info["entry_ts"]).total_seconds())
+            # Precise exit label (DB-02): a close sent by a rule, or a stop
+            # hit after the breakeven / trailing rule moved it.
+            if info.get("exit_reason_override"):
+                exit_reason = info["exit_reason_override"]
+            elif exit_reason == "stop-loss" and info.get("sl_rule"):
+                exit_reason = self._EXIT_LABELS.get(info["sl_rule"], exit_reason)
 
             # Update kill-switch counter and FTMO profit trackers.
             with self._state_lock:
@@ -1610,6 +1872,17 @@ class LiveTrader:
                 if self.cfg.risk_config.ftmo_enabled:
                     self._portfolio_state.ftmo_today_profit  += pnl
                     self._portfolio_state.ftmo_total_profit  += pnl
+                losses = self._portfolio_state.consecutive_losses
+
+            if self._scalp is not None:
+                self._scalp.on_close(info["symbol"], ts, pnl)
+                # FQ-05 — in scalping the kill-switch latches until an
+                # operator clears it (emergency stop), instead of re-arming
+                # by itself after a restart.
+                if losses >= self.cfg.risk_config.max_consecutive_losses:
+                    self.emergency_stop(
+                        f"FQ-05: {losses} consecutive losses — manual reset required"
+                    )
 
             # 1) Feed the learning components, per contributing strategy.
             for strat in info["strategies"]:
@@ -1640,6 +1913,14 @@ class LiveTrader:
                         duration_s  = duration_s,
                         exit_reason = exit_reason,
                         ticket      = str(ticket),
+                        extra       = {
+                            "spread_at_entry": info.get("spread_points"),
+                            "slippage":        info.get("slippage_points"),
+                            "ml_win_proba":    info.get("ml_win_proba"),
+                            "rl_action":       info.get("rl_action"),
+                            "regime":          info.get("regime"),
+                            "rules_version":   self._scalp.rules_version if self._scalp else None,
+                        },
                     )
                 except Exception as exc:
                     logger.warning("monitor.record_trade failed: %s", exc)
@@ -1755,6 +2036,8 @@ class LiveTrader:
             "equity":               equity,
             "balance":              balance,
             "open_positions":       n_positions,
+            "scalping_enabled":     self._scalp is not None,
+            "rules_version":        self._scalp.rules_version if self._scalp else None,
         }
 
     def get_allocation_summary(self) -> dict:

@@ -236,8 +236,10 @@ class TradingMonitor:
         duration_s:  int   = 0,
         exit_reason: str   = "",
         ticket:      str   = "",
+        extra:       Optional[dict] = None,
     ) -> None:
-        """Record a closed trade. Call from LiveTrader / BacktestEngine."""
+        """Record a closed trade. Call from LiveTrader / BacktestEngine.
+        `extra` carries the scalping audit columns (see MetricsStore.write_trade)."""
         with self._lock:
             # Update strategy stats
             stats = self._get_stats(strategy)
@@ -260,6 +262,7 @@ class TradingMonitor:
                 "duration_s":  duration_s,
                 "exit_reason": exit_reason,
                 "ticket":      ticket,
+                **(extra or {}),
             }
             self._trade_buffer.append(trade_row)
 
@@ -272,7 +275,7 @@ class TradingMonitor:
                 direction=direction, size=size,
                 entry_price=entry_price, exit_price=exit_price,
                 pnl=pnl, duration_s=duration_s,
-                exit_reason=exit_reason, ticket=ticket,
+                exit_reason=exit_reason, ticket=ticket, extra=extra,
             )
 
             logger.info(
@@ -673,6 +676,23 @@ class TradingMonitor:
 
     def query_drawdowns(self, **kwargs) -> list[dict]:
         return self._store.query_drawdowns(**kwargs)
+
+    def query_decisions(self, **kwargs) -> list[dict]:
+        return self._store.query_decisions(**kwargs)
+
+    # ------------------------------------------------------------------
+    # Scalping decision journal (SCALPING_RULES.md DB-01 / DB-04)
+    # ------------------------------------------------------------------
+
+    def record_decision(self, row: dict) -> None:
+        """Persist one entry/exit decision and push it to the dashboard."""
+        self._store.write_decision(row)
+        ts = row.get("ts")
+        _broadcast("decision", {**row, "ts": ts.isoformat() if isinstance(ts, datetime) else ts})
+
+    @property
+    def persistence_ok(self) -> bool:
+        return self._store.persistence_ok
 
     # ------------------------------------------------------------------
     # Internal helpers

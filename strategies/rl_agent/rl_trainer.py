@@ -136,6 +136,11 @@ class RewardConfig:
     # above the session median — encourages exploration in uncertain states.
     alpha_novelty:    float = 0.08
 
+    # Over-hold (scalping time stop, SCALPING_RULES.md RL-05): penalty per bar
+    # a position stays open beyond `max_holding_bars`. 0 bars = disabled.
+    max_holding_bars: int   = 0
+    alpha_overhold:   float = 0.0
+
 
 # ---------------------------------------------------------------------------
 # Trading environment with composite reward
@@ -205,6 +210,7 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
         self._hold_streak: int = 0         # consecutive HOLD bars (no position)
         self._prev_position: int = 0       # position at previous step
         self._vol_history: list[float] = []  # recent vol readings for median
+        self._bars_in_position: int = 0    # age of the open position (over-hold)
 
     # ------------------------------------------------------------------
 
@@ -227,6 +233,7 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
         self._hold_streak   = 0
         self._prev_position = 0
         self._vol_history   = []
+        self._bars_in_position = 0
         return self._observe(), {}
 
     def step(self, action: int):
@@ -448,6 +455,17 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
             if vol_proxy > median_vol * 1.2:   # 20% above median = "unusual"
                 novelty_bonus = cfg.alpha_novelty * (vol_proxy - median_vol)
 
+        # I4. Over-hold penalty (scalping time stop)
+        # Counts bars since the current position was opened; a new position
+        # (or a flip) restarts the count.
+        if self._position == 0 or self._position != prev_position:
+            self._bars_in_position = 0
+        else:
+            self._bars_in_position += 1
+        overhold_penalty = 0.0
+        if cfg.max_holding_bars > 0 and self._bars_in_position > cfg.max_holding_bars:
+            overhold_penalty = cfg.alpha_overhold * (self._bars_in_position - cfg.max_holding_bars)
+
         # ------------------------------------------------------------------
         # Composite reward
         # ------------------------------------------------------------------
@@ -461,6 +479,7 @@ class RLTradingEnv(gym.Env if _SB3_AVAILABLE else object):
             - anti_hold_penalty
             + entry_bonus
             + novelty_bonus
+            - overhold_penalty
         )
 
         return float(np.clip(reward, -10.0, 10.0))

@@ -150,6 +150,13 @@ def _make_rl_feature_provider(
         engineer = FeatureEngineer(feature_config or FeatureConfig())
         features = engineer.compute(df).ffill().fillna(0.0)
 
+        # Median historical spread in price units — the RL environment
+        # trains with it instead of a fixed guess (SCALPING_RULES.md RL-04).
+        info = mt5.symbol_info(symbol)
+        point = float(getattr(info, "point", 0.0) or 0.0) if info else 0.0
+        if point > 0 and "spread" in df.columns:
+            features.attrs["spread_price"] = float(df["spread"].median()) * point
+
         first = df.index[0].strftime("%Y-%m-%d") if len(df) else "?"
         last  = df.index[-1].strftime("%Y-%m-%d") if len(df) else "?"
         logger.info(
@@ -161,6 +168,14 @@ def _make_rl_feature_provider(
         return features
 
     return _provider
+
+
+def _rl_timeframe(settings, fallback: Optional[str] = None) -> str:
+    """Timeframe the RL agent trains on: the scalping execution timeframe
+    when scalping is enabled (RL-03), else TRADING_RL_TIMEFRAME."""
+    if settings.scalping.enabled:
+        return settings.scalping.rl_timeframe
+    return settings.trading.rl_timeframe or fallback or "H1"
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +308,7 @@ def create_app(
                 tp_atr_multiplier      = body.tp_atr_multiplier,
                 ftmo_enabled           = body.ftmo_enabled,
                 ftmo_initial_balance   = body.ftmo_initial_balance,
+                scalping_enabled       = body.scalping_enabled,
                 # MT5 credentials sourced from .env (optional — an
                 # already-logged-in terminal works without them).
                 mt5_login    = settings.mt5.login,
@@ -390,7 +406,35 @@ def create_app(
             "ml_min_win_proba":  _cfg.trading.ml_min_win_proba,
             "sl_atr_multiplier": _cfg.trading.sl_atr_multiplier,
             "tp_atr_multiplier": _cfg.trading.tp_atr_multiplier,
+            "scalping_enabled":  _cfg.scalping.enabled,
         })
+
+    # ====================================================================
+    # /scalping — rule set (SCALPING_RULES.md) and decision journal
+    # ====================================================================
+
+    @app.get("/scalping/rules", tags=["scalping"], dependencies=[Auth])
+    def scalping_rules():
+        """Scalping rule values in force (from .env, SCALP_* variables)."""
+        from dataclasses import asdict
+        from config.settings import settings as _cfg
+        running = bool(_state.trader is not None and getattr(_state.trader, "_scalp", None))
+        return ok({**asdict(_cfg.scalping), "active_in_trader": running})
+
+    @app.get("/scalping/decisions", tags=["scalping"], dependencies=[Auth])
+    def scalping_decisions(
+        limit:   int = Query(100, ge=1, le=1000),
+        symbol:  Optional[str] = Query(None),
+        verdict: Optional[str] = Query(None),
+    ):
+        """Latest journaled decisions (accepted, refused, closes, SL moves)."""
+        if _state.monitor is None:
+            return ok([])
+        return ok(_state.monitor.query_decisions(
+            symbol=symbol.upper() if symbol else None,
+            verdict=verdict.upper() if verdict else None,
+            limit=limit,
+        ))
 
     # ====================================================================
     # /rl  — learning models (manual retraining from collected results)
@@ -426,11 +470,7 @@ def create_app(
                 # RL training uses its own timeframe (H1 by default), separate
                 # from the live-trading timeframe (e.g. M1). This gives RL
                 # access to years of H1 history while live decisions run on M1.
-                rl_tf = (
-                    _cfg.trading.rl_timeframe
-                    or getattr(cfg, "timeframe", None)
-                    or "H1"
-                )
+                rl_tf = _rl_timeframe(_cfg, getattr(cfg, "timeframe", None))
                 feature_config = getattr(cfg, "feature_config", None)
 
         # RL needs a long, continuous price-series history (not the sparse
@@ -1265,9 +1305,9 @@ def create_app(
                     timeframe = getattr(cfg, "timeframe", None) or timeframe
                     feature_config = getattr(cfg, "feature_config", None)
 
-            # RL always trains on its own dedicated timeframe (H1 by default),
-            # independent of the M1/M5 live-trading timeframe.
-            rl_tf = _cfg.trading.rl_timeframe or "H1"
+            # RL trains on its own dedicated timeframe (H1 by default, the
+            # scalping timeframe when scalping is enabled — RL-03).
+            rl_tf = _rl_timeframe(_cfg)
             provider = _make_rl_feature_provider(
                 symbol=symbol,
                 timeframe=rl_tf,

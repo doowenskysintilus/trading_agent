@@ -49,6 +49,7 @@ export default function TradingControls({ running, emergency }) {
   const [slMultiplier, setSlMultiplier] = useState(2.0)
   const [tpMultiplier, setTpMultiplier] = useState(4.0)
   const [ftmoEnabled,  setFtmoEnabled]  = useState(false)
+  const [scalpEnabled, setScalpEnabled] = useState(false)
 
   // Pre-fill the panel with the defaults configured in .env (server-side).
   useEffect(() => {
@@ -70,6 +71,7 @@ export default function TradingControls({ running, emergency }) {
         if (typeof cfg.ml_min_win_proba === 'number') setMlMinWin(cfg.ml_min_win_proba)
         if (typeof cfg.sl_atr_multiplier === 'number') setSlMultiplier(cfg.sl_atr_multiplier)
         if (typeof cfg.tp_atr_multiplier === 'number') setTpMultiplier(cfg.tp_atr_multiplier)
+        if (typeof cfg.scalping_enabled === 'boolean') setScalpEnabled(cfg.scalping_enabled)
       })
       .catch(() => { /* keep hardcoded fallbacks */ })
     return () => { cancelled = true }
@@ -116,8 +118,8 @@ export default function TradingControls({ running, emergency }) {
       return
     }
     // Guard against empty / invalid numeric fields, which would otherwise be
-    // sent as 0 and rejected by the API (cycle ≥ 60, balance > 0 → 422).
-    const cycle = Math.min(Math.max(Number(interval) || 0, 60), 86400)
+    // sent as 0 and rejected by the API (cycle ≥ 1, balance > 0 → 422).
+    const cycle = Math.min(Math.max(Number(interval) || 0, 1), 86400)
     const bal   = Number(balance) > 0 ? Number(balance) : 100000
     const bars  = useMaxBars ? 0 : Math.min(Math.max(Number(warmupBars) || 0, 50), 500000)
     try {
@@ -138,10 +140,13 @@ export default function TradingControls({ running, emergency }) {
         // and the immutable challenge reference (RiskEngine Layer 1b).
         ftmo_enabled:         ftmoEnabled,
         ftmo_initial_balance: ftmoEnabled ? bal : 0,
+        // Scalping rule set (SCALPING_RULES.md) — overrides SL/TP, sizing
+        // and thresholds server-side.
+        scalping_enabled: scalpEnabled,
       })
       setOpen(false)
     } catch { /* error already surfaced */ }
-  }, [callApi, symbols, timeframe, interval, warmupBars, useMaxBars, balance, allocation, htfEnabled, htfTimeframe, mlEnabled, mlMinWin, ftmoEnabled])
+  }, [callApi, symbols, timeframe, interval, warmupBars, useMaxBars, balance, allocation, htfEnabled, htfTimeframe, mlEnabled, mlMinWin, slMultiplier, tpMultiplier, ftmoEnabled, scalpEnabled])
 
   const handleStop = useCallback(async () => {
     try {
@@ -385,6 +390,29 @@ export default function TradingControls({ running, emergency }) {
               Enforces FTMO's actual limits (daily loss 5%, drawdown 10%, soft-stopped
               earlier) against the Initial Balance above as the fixed challenge
               reference — stricter than the generic risk limits otherwise used.
+            </p>
+          )}
+
+          <div className="tc-row">
+            <div className="tc-field">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={scalpEnabled}
+                  onChange={(e) => setScalpEnabled(e.target.checked)}
+                  style={{ marginRight: 6, verticalAlign: 'middle' }}
+                />
+                Scalping rules (SCALPING_RULES.md)
+              </label>
+            </div>
+          </div>
+          {scalpEnabled && (
+            <p className="tc-hint">
+              Every entry and exit goes through the scalping rule engine: sessions,
+              spread, cooldowns, ML filter, time stop, breakeven and ATR trailing.
+              Its values (SL 1.2 / TP 1.5 ATR, 0.25 % risk, min confidence 0.55…)
+              replace the SL/TP, ML and cycle fields above. Configure them with the
+              SCALP_* variables in .env.
             </p>
           )}
 

@@ -42,7 +42,8 @@ class TradingStartRequest(BaseModel):
     # parameters can be changed without touching code.
     symbols:              list[str]   = Field(default_factory=lambda: list(settings.trading.symbols))
     timeframe:            str         = Field(default_factory=lambda: settings.trading.timeframe)
-    cycle_interval_s:     int         = Field(default_factory=lambda: settings.trading.cycle_seconds, ge=60, le=86400)
+    # ge=1: scalping manages open positions every few seconds.
+    cycle_interval_s:     int         = Field(default_factory=lambda: settings.trading.cycle_seconds, ge=1, le=86400)
     warmup_bars:          int         = Field(
         default_factory=lambda: settings.trading.warmup_bars,
         ge=0,
@@ -64,6 +65,8 @@ class TradingStartRequest(BaseModel):
     # looser on drawdown (15-20%) than what FTMO would actually enforce.
     ftmo_enabled:         bool        = False
     ftmo_initial_balance: float       = Field(default=0.0, ge=0.0)
+    # Scalping rule set (SCALPING_RULES.md) — default from SCALP_ENABLED.
+    scalping_enabled:     bool        = Field(default_factory=lambda: settings.scalping.enabled)
 
     class Config:
         json_schema_extra = {

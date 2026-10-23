@@ -34,6 +34,15 @@ from strategies.ml_agent.win_classifier import WinClassifier
 logger = logging.getLogger(__name__)
 
 
+def _scalping_settings():
+    """ScalpingSettings when SCALP_ENABLED=true, else None."""
+    try:
+        from config.settings import settings
+    except Exception:
+        return None
+    return settings.scalping if settings.scalping.enabled else None
+
+
 def _should_promote_rl(baseline_reward: Optional[float], candidate_reward: Optional[float]) -> bool:
     """RL promotion decision, isolated for direct unit testing.
 
@@ -250,7 +259,14 @@ class RetrainService:
     def _retrain_ml(self) -> dict:
         X, y, names = build_supervised_dataset(self.dataset_dir)
         clf    = WinClassifier(model_path=f"{self.model_dir}/win_classifier.joblib")
-        report = clf.train(X, y, names)
+        scalp  = _scalping_settings()
+        if scalp is not None:
+            # ML-04 / ML-07 (SCALPING_RULES.md)
+            report = clf.train(X, y, names,
+                               min_samples=scalp.ml_min_samples,
+                               min_reliable_auc=scalp.ml_min_reliable_auc)
+        else:
+            report = clf.train(X, y, names)
         result = report.as_dict()
         self._print_ml_report(result)
         return result
@@ -346,6 +362,17 @@ class RetrainService:
             total_timesteps = timesteps,
             model_dir       = self.model_dir,
         )
+        # RL-04 — train with the spread actually measured on the broker's
+        # history (attached by the feature provider), not a fixed guess.
+        measured_spread = (feature_df.attrs.get("spread_price")
+                           if feature_df is not None else None)
+        if measured_spread and measured_spread > 0:
+            cfg.spread = float(measured_spread)
+        # RL-05 — penalise holding a scalp longer than the live time stop.
+        scalp = _scalping_settings()
+        if scalp is not None:
+            cfg.reward_config.max_holding_bars = scalp.max_holding_bars
+            cfg.reward_config.alpha_overhold   = scalp.rl_overhold_penalty
 
         try:
             trainer = RLTrainer(cfg)
