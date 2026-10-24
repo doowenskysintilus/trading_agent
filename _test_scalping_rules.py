@@ -467,6 +467,21 @@ check(mon.trades and mon.trades[-1]["exit_reason"] == "time_stop"
 check(trader.emergency.is_active, "6th consecutive loss latches the emergency stop (FQ-05)")
 trader.emergency.clear()
 
+section("TEST 6: real-cost gate in normal (non-scalping) mode")
+normal = LiveTrader(LiveTraderConfig(symbols=["BTCUSD"], htf_enabled=False,
+                                     collect_experiences=False, ml_filter_enabled=False))
+normal._exec_engine = fake
+normal._commissions = CommissionModel(0.000035, provider=lambda: {"BTCUSD": {"rate_per_side": 0.000326}})
+fake.bar_end = datetime.now(timezone.utc)
+tight = TradeOrder("BTCUSD", "agg", 1, 0.02, 81_005, 50, stop_loss=80_905, take_profit=81_205)
+wide = TradeOrder("BTCUSD", "agg", 1, 0.02, 81_005, 200, stop_loss=80_605, take_profit=81_805)
+r_tight, r_wide = normal._check_trade_costs(tight), normal._check_trade_costs(wide)
+check(r_tight is not None and not r_tight.passed,
+      f"BTC TP 200 $ vs ~58 $ real round-trip cost → refused ({r_tight and r_tight.reason})")
+check(r_wide is not None and r_wide.passed, "BTC TP 800 $ / SL 400 $ → accepted")
+normal.cfg.min_net_reward_risk = 0
+check(normal._check_trade_costs(tight) is None, "TRADING_MIN_NET_RR=0 disables the gate")
+
 print("\n" + "=" * 70)
 print("RESULT")
 print("=" * 70)

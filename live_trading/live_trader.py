@@ -72,7 +72,9 @@ from research.alpha_models.base import AlphaModel, AlphaSignal, SignalType
 from research.feature_store.calendar_provider import CalendarProvider
 from research.feature_store.feature_engineer import FeatureConfig, FeatureEngineer
 from live_trading.experience_collector import ExperienceCollector, extract_observation
+from engines.rule_engine import EntryContext
 from engines.rule_engine.costs import CommissionModel
+from engines.rule_engine.signal_rules import RewardRiskRule
 from live_trading.scalping import ScalpingController
 from strategies.ml_agent.win_classifier import WinClassifier, WinPrediction
 
@@ -264,6 +266,12 @@ class LiveTraderConfig:
     risk_config: RiskConfig = field(default_factory=RiskConfig)
     sl_atr_multiplier: float = 2.0
     tp_atr_multiplier: float = 4.0
+    # Real-cost gate for every mode (the scalping rule set has its own,
+    # stricter, EX-03): refuse an order whose take-profit cannot pay the
+    # round-trip cost — spread + the commission measured on this symbol.
+    # 0 disables the check.
+    min_net_reward_risk: float = 1.0   # (TP − costs) / (SL + costs)
+    min_tp_cost_ratio:   float = 3.0   # TP distance ≥ k × round-trip cost
 
     # ---- Economic calendar (feeds RiskEngine Layers 0/4 + CalendarAlpha) -
     # Previously nothing ever passed a CalendarProvider to RiskEngine here,
@@ -479,6 +487,13 @@ class LiveTrader:
                 reject_below_min_volume = scalp is not None,
             )
         )
+        # Commission per symbol measured on the account's MT5 history, used
+        # by the cost checks of every mode.
+        from config.settings import settings as _settings
+        self._commissions = CommissionModel(
+            (scalp or _settings.scalping).commission_pct_per_side,
+            provider=self._measured_commission_rates,
+        )
         self._scalp: Optional[ScalpingController] = None
         if scalp is not None:
             self._scalp = ScalpingController(
@@ -488,10 +503,7 @@ class LiveTrader:
                 calendar_provider = self._calendar_provider,
                 exec_engine       = self._exec_engine,
                 sink_getter       = lambda: self._monitor,
-                commission_model  = CommissionModel(
-                    scalp.commission_pct_per_side,
-                    provider=self._measured_commission_rates,
-                ),
+                commission_model  = self._commissions,
             )
 
         # ---- State -------------------------------------------------------
@@ -1000,7 +1012,15 @@ class LiveTrader:
             # 5. Apply risk engine ----------------------------------------
             trade_order  = self._build_trade_order(symbol, decision)
 
-            # 5a. Scalping rules — stage 5 (order: size, live price, R:R) --
+            # 5a. Real-cost gate (normal mode; scalping has EX-03 below) ---
+            if self._scalp is None:
+                cost_check = self._check_trade_costs(trade_order)
+                if cost_check is not None and not cost_check.passed:
+                    logger.info("    [%s] Cost gate: %s → skip", symbol, cost_check.reason)
+                    result.status = CycleStatus.RULE_BLOCKED
+                    return result
+
+            # 5b. Scalping rules — stage 5 (order: size, live price, R:R) --
             if self._scalp is not None:
                 trade_order.size = round(trade_order.size * scalp_size_mult, 2)   # SZ-04
                 self._scalp.rebase_order(trade_order, scalp_ctx.snapshot)
@@ -1433,6 +1453,21 @@ class LiveTrader:
     # ------------------------------------------------------------------
     # Scalping helpers
     # ------------------------------------------------------------------
+
+    def _check_trade_costs(self, order: TradeOrder):
+        """Net reward:risk of an order after spread + measured commission.
+        None when the check is disabled or no live quote is available."""
+        get_snapshot = getattr(self._exec_engine, "get_symbol_snapshot", None)
+        if self.cfg.min_net_reward_risk <= 0 or get_snapshot is None:
+            return None
+        snapshot = get_snapshot(order.symbol)
+        if not snapshot:
+            return None
+        spread = max(0.0, snapshot["ask"] - snapshot["bid"])
+        cost = spread + 2.0 * self._commissions.rate(order.symbol) * order.entry_price
+        ctx = EntryContext(order.symbol, datetime.now(timezone.utc), 0,
+                           order=order, round_trip_cost=cost)
+        return RewardRiskRule(self.cfg.min_net_reward_risk, self.cfg.min_tp_cost_ratio).evaluate(ctx)
 
     def _measured_commission_rates(self) -> dict[str, dict]:
         """Commission per symbol measured on this account's MT5 history."""

@@ -45,6 +45,7 @@ import pandas as pd
 
 from backtesting.metrics import MetricsCalculator, PerformanceMetrics, compare_metrics
 from engines.risk_engine.risk_engine import RiskConfig
+from engines.rule_engine.indicators import atr_series
 from engines.portfolio_engine.portfolio_engine import AllocationMethod
 from research.alpha_models.base import AlphaModel, SignalType
 
@@ -74,6 +75,12 @@ class BacktestConfig:
     position_size_pct: float = 0.10   # fraction of equity per trade
     sl_pct: float          = 0.02
     tp_pct: float          = 0.04
+    # ATR-based exits, as the live trader uses (> 0 overrides sl_pct/tp_pct).
+    sl_atr_multiplier: float = 0.0
+    tp_atr_multiplier: float = 0.0
+    atr_period: int          = 14
+    # Close a position after this many bars (scalping time stop). 0 = off.
+    max_holding_bars: int    = 0
 
     # ---- Engine params ---------------------------------------------------
     window_size: int       = 50        # lookback bars fed to each strategy
@@ -120,7 +127,8 @@ class TradeRecord:
     entry_price: float
     exit_price: float
     pnl: float
-    exit_reason: str    # "sl" | "tp" | "signal" | "eod"
+    exit_reason: str    # "sl" | "tp" | "signal" | "time" | "eod"
+    costs: float = 0.0  # commissions + spread paid (already inside pnl)
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +188,10 @@ class _StrategySim:
         self.equity_curve: list[float] = []
         self.exposure_mask: list[bool] = []
         self.trades: list[TradeRecord] = []
+        self._atr = (
+            atr_series(self.data, config.atr_period).bfill().to_numpy()
+            if config.sl_atr_multiplier > 0 else None
+        )
 
     # ------------------------------------------------------------------
 
@@ -196,11 +208,14 @@ class _StrategySim:
             high   = float(self.data.at[bar, "high"])
             low    = float(self.data.at[bar, "low"])
 
-            # ---- Check SL/TP on open position ---------------------------
+            # ---- Check SL/TP, then the time stop, on the open position ---
             if self.position:
                 exit_price, reason = self._check_sl_tp(high, low)
                 if exit_price:
                     self._close(bar, exit_price, reason)
+                elif (cfg.max_holding_bars > 0
+                      and bar - self.position.entry_bar >= cfg.max_holding_bars):
+                    self._close(bar, close, "time")
 
             # ---- Generate signal ----------------------------------------
             try:
@@ -248,8 +263,13 @@ class _StrategySim:
             return
 
         self.balance -= commission
-        sl = exec_price * (1 - self.cfg.sl_pct * direction)
-        tp = exec_price * (1 + self.cfg.tp_pct * direction)
+        atr = float(self._atr[bar]) if self._atr is not None else 0.0
+        if atr > 0:
+            sl = exec_price - direction * self.cfg.sl_atr_multiplier * atr
+            tp = exec_price + direction * self.cfg.tp_atr_multiplier * atr
+        else:
+            sl = exec_price * (1 - self.cfg.sl_pct * direction)
+            tp = exec_price * (1 + self.cfg.tp_pct * direction)
 
         self.position = SimPosition(
             direction     = direction,
@@ -268,8 +288,17 @@ class _StrategySim:
         commission = exec_price * pos.size * self.cfg.commission
         raw_pnl    = (exec_price - pos.entry_price) * pos.direction * pos.size
         net_pnl    = raw_pnl - commission
+        # Spread paid on both fills + both commissions; net_pnl already has
+        # the exit commission and the spread, the entry commission was taken
+        # from the balance at entry.
+        spread_cost = (self._half_spread(pos.entry_bar) + self._half_spread(bar)) * pos.size
+        costs = pos.commission_paid + commission + spread_cost
 
-        self.balance += pos.size * exec_price - commission
+        # The notional was never taken out of the balance at entry (only the
+        # commission was), so only the realised P&L comes back. Adding back
+        # size × price credited the whole notional on every close: equity
+        # grew ~position_size_pct per trade whatever the outcome.
+        self.balance += raw_pnl - commission
         self.trades.append(TradeRecord(
             strategy    = pos.strategy,
             entry_bar   = pos.entry_bar,
@@ -278,8 +307,9 @@ class _StrategySim:
             size        = pos.size,
             entry_price = pos.entry_price,
             exit_price  = exec_price,
-            pnl         = net_pnl,
+            pnl         = net_pnl - pos.commission_paid,
             exit_reason = reason,
+            costs       = costs,
         ))
         self.position = None
 
@@ -507,6 +537,7 @@ class BacktestEngine:
                 "entry_price": round(t.entry_price, 5),
                 "exit_price":  round(t.exit_price, 5),
                 "pnl":         round(t.pnl, 4),
+                "costs":       round(t.costs, 4),
                 "exit_reason": t.exit_reason,
                 "duration":    t.exit_bar - t.entry_bar,
             })

@@ -173,6 +173,14 @@ class TradingSettings:
     tp_atr_multiplier: float = field(
         default_factory=lambda: _get_float("TRADING_TP_ATR_MULTIPLIER", 4.0)
     )
+    # Real-cost gate for every mode: the take-profit must pay the round-trip
+    # cost (spread + commission measured per symbol). 0 disables it.
+    min_net_reward_risk: float = field(
+        default_factory=lambda: _get_float("TRADING_MIN_NET_RR", 1.0)
+    )
+    min_tp_cost_ratio: float = field(
+        default_factory=lambda: _get_float("TRADING_MIN_TP_COST_RATIO", 3.0)
+    )
 
     # ---- RL always-on background retraining -----------------------------
     # Keep RL retraining loop running as long as the API process is alive.

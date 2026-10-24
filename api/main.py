@@ -324,6 +324,8 @@ def create_app(
                 ftmo_enabled           = body.ftmo_enabled,
                 ftmo_initial_balance   = body.ftmo_initial_balance,
                 scalping_enabled       = body.scalping_enabled,
+                min_net_reward_risk    = settings.trading.min_net_reward_risk,
+                min_tp_cost_ratio      = settings.trading.min_tp_cost_ratio,
                 # MT5 credentials sourced from .env (optional — an
                 # already-logged-in terminal works without them).
                 mt5_login    = settings.mt5.login,
