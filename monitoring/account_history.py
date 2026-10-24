@@ -137,6 +137,43 @@ class AccountHistory:
         trades.sort(key=lambda t: t.close_time, reverse=True)
         return trades
 
+    def commission_rates(
+        self,
+        contract_size: Callable[[str], float],
+        last_n: int = 50,
+        min_trades: int = 3,
+    ) -> dict[str, dict]:
+        """Real commission per symbol, as a fraction of traded notional per
+        side (the unit the scalping cost model uses), measured on the last
+        `last_n` closed trades of each symbol. Symbols with fewer than
+        `min_trades` trades are left out (caller keeps its default).
+
+        Notional is in the account currency (USD): units × price for xxxUSD
+        symbols, units for USDxxx symbols (the base is already USD).
+        """
+        samples: dict[str, list[tuple[float, float]]] = {}
+        for t in self.closed_trades():              # newest first
+            rows = samples.setdefault(t.symbol, [])
+            if len(rows) >= last_n or not t.volume or not t.commission:
+                continue
+            size = contract_size(t.symbol) or 0.0
+            units = t.volume * size
+            notional = units if t.symbol.upper().startswith("USD") else units * t.open_price
+            if notional > 0:
+                rows.append((abs(t.commission) / (2.0 * notional), abs(t.commission) / t.volume))
+        out = {}
+        for symbol, rows in samples.items():
+            if len(rows) < min_trades:
+                continue
+            rates = sorted(r for r, _ in rows)
+            per_lot = sorted(p for _, p in rows)
+            out[symbol] = {
+                "rate_per_side":         rates[len(rates) // 2],          # median
+                "per_lot_round_trip":    round(per_lot[len(per_lot) // 2], 2),
+                "trades":                len(rows),
+            }
+        return out
+
     def cash_flows(self) -> list[dict]:
         """Deposits, withdrawals, credits — every non-trading deal with money."""
         return [{

@@ -40,6 +40,7 @@ const PAGE = 50
 
 export default function AccountHistory() {
   const [summary, setSummary] = useState(null)
+  const [fees,    setFees]    = useState(null)
   const [series,  setSeries]  = useState([])
   const [trades,  setTrades]  = useState([])
   const [total,   setTotal]   = useState(0)
@@ -68,12 +69,14 @@ export default function AccountHistory() {
         if (!r.ok || d?.success === false) throw new Error(d?.detail || d?.error || `HTTP ${r.status}`)
         return d.data
       }
-      const [s, p, h] = await Promise.all([
+      const [s, p, h, f] = await Promise.all([
         get(`/api/account/summary?source=${source}&tz_offset_min=${TZ_OFFSET_MIN}`),
         get(`/api/account/pnl?${query({ group })}`),
         get(`/api/account/history?${query({ limit: '10000' })}`),
+        get('/api/account/commissions').catch(() => null),
       ])
       setSummary(s)
+      setFees(f)
       setSeries(p || [])
       setTrades(h?.trades || [])
       setTotal(h?.total || 0)
@@ -189,6 +192,36 @@ export default function AccountHistory() {
           <span><i style={{ background: 'var(--accent)' }} /> cumul sur la période (axe de droite)</span>
         </div>
       </div>
+
+      {/* ── Real fees per symbol ───────────────────────────────────────── */}
+      {fees?.measured && Object.keys(fees.measured).length > 0 && (
+        <div className="ah-card">
+          <div className="ah-card-head">
+            <span>Commissions réelles par symbole</span>
+            <span>
+              mesurées sur les derniers trades fermés — utilisées par les règles de scalping
+              (défaut {(fees.default_rate_per_side * 100).toFixed(4)} %/côté sans historique)
+            </span>
+          </div>
+          <div className="ah-table-wrap">
+            <table className="ah-table">
+              <thead>
+                <tr><th>Symbole</th><th>Par côté (% du notionnel)</th><th>Aller-retour par lot</th><th>Trades mesurés</th></tr>
+              </thead>
+              <tbody>
+                {Object.entries(fees.measured).sort().map(([sym, f]) => (
+                  <tr key={sym}>
+                    <td>{sym}</td>
+                    <td>{(f.rate_per_side * 100).toFixed(4)} %</td>
+                    <td>{money(f.per_lot_round_trip)}</td>
+                    <td>{f.trades}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* ── Closed trades ──────────────────────────────────────────────── */}
       <div className="ah-card">

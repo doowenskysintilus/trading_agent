@@ -372,6 +372,10 @@ class RetrainService:
                            if feature_df is not None else None)
         if measured_spread and measured_spread > 0:
             cfg.spread = float(measured_spread)
+        measured_commission = (feature_df.attrs.get("commission_pct")
+                               if feature_df is not None else None)
+        if measured_commission and measured_commission > 0:
+            cfg.commission_pct = float(measured_commission)
         # RL-05 — penalise holding a scalp longer than the live time stop.
         scalp = _scalping_settings()
         if scalp is not None:

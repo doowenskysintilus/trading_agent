@@ -28,6 +28,7 @@ from engines.rule_engine import (
     ManagedPosition, MarketSnapshot, PositionAction, PositionContext,
     TradeJournal, build_scalping_engine,
 )
+from engines.rule_engine.costs import CommissionModel
 from engines.rule_engine.market_time import timeframe_seconds
 
 logger = logging.getLogger(__name__)
@@ -55,10 +56,12 @@ class ScalpingController:
         calendar_provider,
         exec_engine,
         sink_getter: Callable[[], object],
+        commission_model: Optional[CommissionModel] = None,
     ) -> None:
         self.cfg = settings
         self.timeframe_s = timeframe_seconds(timeframe)
         self.journal = TradeJournal()
+        self.commissions = commission_model or CommissionModel(settings.commission_pct_per_side)
         self._exec = exec_engine
         self._sink_getter = sink_getter
         self._last_reject: dict[str, str] = {}
@@ -123,10 +126,11 @@ class ScalpingController:
             volume_step = raw.get("volume_step", 0.01),
         )
 
-    def round_trip_cost(self, snapshot: Optional[MarketSnapshot], price: float) -> float:
-        """Spread + commission on both sides, in price units."""
+    def round_trip_cost(self, snapshot: Optional[MarketSnapshot], price: float, symbol: str) -> float:
+        """Spread + commission on both sides, in price units. The commission
+        rate is the one measured on this symbol's own closed trades."""
         spread = snapshot.spread_price if snapshot else 0.0
-        return spread + 2.0 * self.cfg.commission_pct_per_side * price
+        return spread + 2.0 * self.commissions.rate(symbol) * price
 
     def build_context(
         self,
@@ -147,7 +151,7 @@ class ScalpingController:
             atr             = atr,
             portfolio_state = portfolio_state,
             open_symbols    = open_symbols,
-            round_trip_cost = self.round_trip_cost(snap, price),
+            round_trip_cost = self.round_trip_cost(snap, price, symbol),
         )
 
     # ------------------------------------------------------------------

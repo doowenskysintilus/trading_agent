@@ -199,6 +199,14 @@ good = TradeOrder("BTCUSD", "agg", 1, 0.1, 81_000, 100, stop_loss=80_880, take_p
 bad = TradeOrder("BTCUSD", "agg", 1, 0.1, 81_000, 100, stop_loss=80_880, take_profit=81_020)
 check(rr.evaluate(EntryContext("BTCUSD", now, 60, order=good, round_trip_cost=10)).passed,
       "TP 150 / SL 120 / cost 10 → net R:R 1.07 OK")
+
+from engines.rule_engine.costs import CommissionModel
+
+cm = CommissionModel(0.000035, provider=lambda: {"BTCUSD": {"rate_per_side": 0.000326}})
+check(cm.rate("BTCUSD") == 0.000326 and cm.rate("btcusd") == 0.000326, "measured BTCUSD commission used")
+check(cm.rate("XAUUSD") == 0.000035, "symbol without history → configured default")
+broken = CommissionModel(0.000035, provider=lambda: 1 / 0)
+check(broken.rate("BTCUSD") == 0.000035, "history unavailable → default, no crash")
 check(not rr.evaluate(EntryContext("BTCUSD", now, 60, order=bad, round_trip_cost=10)).passed,
       "TP 20 < 3 × cost → EX-03")
 
@@ -285,6 +293,15 @@ ctrl = ScalpingController(settings.scalping, timeframe="M1", risk_engine=risk, c
 ctrl.restore_once()
 check(ctrl.journal.count_entries(recent - timedelta(seconds=1), "BTCUSD") == 4,
       "DB-03: 4 entries restored from the journal after a restart")
+
+ctrl_fees = ScalpingController(
+    settings.scalping, timeframe="M1", risk_engine=risk, calendar_provider=None,
+    exec_engine=SimpleNamespace(), sink_getter=lambda: sink,
+    commission_model=CommissionModel(0.000035, provider=lambda: {"BTCUSD": {"rate_per_side": 0.000326}}),
+)
+btc_cost = ctrl_fees.round_trip_cost(snap, 81_000.0, "BTCUSD")
+check(abs(btc_cost - (5.0 + 2 * 0.000326 * 81_000)) < 1e-6,
+      f"BTCUSD round-trip cost uses the measured rate: {btc_cost:.2f} (was {5 + 2 * 0.000035 * 81_000:.2f})")
 
 X = np.random.default_rng(1).normal(size=(400, 3))
 y = (np.random.default_rng(2).random(400) > 0.5).astype(int)      # pure noise → AUC ≈ 0.5

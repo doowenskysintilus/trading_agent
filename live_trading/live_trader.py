@@ -72,6 +72,7 @@ from research.alpha_models.base import AlphaModel, AlphaSignal, SignalType
 from research.feature_store.calendar_provider import CalendarProvider
 from research.feature_store.feature_engineer import FeatureConfig, FeatureEngineer
 from live_trading.experience_collector import ExperienceCollector, extract_observation
+from engines.rule_engine.costs import CommissionModel
 from live_trading.scalping import ScalpingController
 from strategies.ml_agent.win_classifier import WinClassifier, WinPrediction
 
@@ -487,6 +488,10 @@ class LiveTrader:
                 calendar_provider = self._calendar_provider,
                 exec_engine       = self._exec_engine,
                 sink_getter       = lambda: self._monitor,
+                commission_model  = CommissionModel(
+                    scalp.commission_pct_per_side,
+                    provider=self._measured_commission_rates,
+                ),
             )
 
         # ---- State -------------------------------------------------------
@@ -1428,6 +1433,16 @@ class LiveTrader:
     # ------------------------------------------------------------------
     # Scalping helpers
     # ------------------------------------------------------------------
+
+    def _measured_commission_rates(self) -> dict[str, dict]:
+        """Commission per symbol measured on this account's MT5 history."""
+        from monitoring.account_history import AccountHistory
+        history = AccountHistory(
+            fetch_deals  = self._exec_engine.get_history_deals,
+            utc_offset_s = self._exec_engine.server_utc_offset_s,
+            bot_magic    = self.cfg.magic_number,
+        )
+        return history.commission_rates(self._exec_engine.get_contract_size)
 
     def _open_position_symbols(self) -> list[str]:
         try:

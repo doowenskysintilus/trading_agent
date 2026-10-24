@@ -156,6 +156,21 @@ def _make_rl_feature_provider(
         point = float(getattr(info, "point", 0.0) or 0.0) if info else 0.0
         if point > 0 and "spread" in df.columns:
             features.attrs["spread_price"] = float(df["spread"].median()) * point
+        # Same for the commission: the rate measured on this account's own
+        # closed trades of the symbol, when there are enough of them.
+        engine = get_app_state().execution_engine
+        if engine is not None:
+            try:
+                from config.settings import settings as _cfg
+                from monitoring.account_history import AccountHistory
+                rates = AccountHistory(
+                    engine.get_history_deals, engine.server_utc_offset_s, _cfg.mt5.magic_number,
+                ).commission_rates(engine.get_contract_size)
+                measured = rates.get(symbol) or rates.get(symbol.upper())
+                if measured:
+                    features.attrs["commission_pct"] = measured["rate_per_side"]
+            except Exception as exc:
+                logger.debug("Measured commission unavailable for RL: %s", exc)
 
         first = df.index[0].strftime("%Y-%m-%d") if len(df) else "?"
         last  = df.index[-1].strftime("%Y-%m-%d") if len(df) else "?"
@@ -824,6 +839,17 @@ def create_app(
             source=source,
             tz_offset_min=tz_offset_min,
         ))
+
+    @app.get("/account/commissions", tags=["account"], dependencies=[Auth])
+    def account_commissions():
+        """Real commission per symbol measured on the account's closed trades
+        (what the scalping cost rules use), plus the configured fallback."""
+        from config.settings import settings as _cfg
+        measured = _account_history().commission_rates(_state.execution_engine.get_contract_size)
+        return ok({
+            "default_rate_per_side": _cfg.scalping.commission_pct_per_side,
+            "measured": measured,
+        })
 
     @app.get("/account/history", tags=["account"], dependencies=[Auth])
     def account_history(

@@ -511,6 +511,13 @@ class MT5ExecutionEngine:
                            ticket, res.retcode if res else "None")
         return ok
 
+    def get_contract_size(self, symbol: str) -> float:
+        """Units per lot (100 000 for FX, 100 for XAUUSD, 1 for BTCUSD…)."""
+        if not self._connected or not _MT5_AVAILABLE:
+            return 0.0
+        info = mt5.symbol_info(symbol)
+        return float(getattr(info, "trade_contract_size", 0.0) or 0.0) if info else 0.0
+
     def get_symbol_snapshot(self, symbol: str) -> Optional[dict]:
         """Live quote + symbol properties used by the scalping rules."""
         if not self._connected or not _MT5_AVAILABLE:

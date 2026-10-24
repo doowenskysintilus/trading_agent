@@ -41,6 +41,7 @@ Si une de ces règles échoue, **aucun signal n'est calculé** pour ce symbole s
 | MK-03 | Pas d'entrée Forex le week-end, le vendredi après 19:00 UTC, ni dans les 30 min après l'ouverture du dimanche | — | `SessionRule` |
 | MK-04 | Spread max | ≤ 0,25 × ATR(14) **et** ≤ plafond par symbole (`EURUSD` 10 pts, `XAUUSD` 30 pts, `BTCUSD` 2000 pts) | `SpreadRule` — `SCALP_MAX_SPREAD_POINTS` |
 | MK-05 | Volatilité minimale | ATR ≥ 2 × coût aller-retour (spread + commission) | `VolatilityRule` |
+| MK-05b | Commission = **mesurée par symbole** sur les derniers trades fermés du compte (recalcul horaire) ; `SCALP_COMMISSION_PCT` seulement pour un symbole sans historique (< 3 trades) | ex. FTMO : BTCUSD 0,0326 %/côté, EURUSD 0,0026 %/côté | `CommissionModel` (`engines/rule_engine/costs.py`), `GET /account/commissions` |
 | MK-06 | Volatilité maximale | ATR ≤ 3 × médiane ATR des 500 dernières bougies | `VolatilityRule` |
 | MK-07 | Blackout événement économique HIGH | ±15 min **avant et après** | `EventWindowRule` + `CalendarProvider.event_is_active` (corrigé : voyait seulement le futur) |
 | MK-08 | Données fraîches | dernière bougie fermée ≤ 2 bougies d'âge (horloge du broker) | `DataFreshnessRule` |

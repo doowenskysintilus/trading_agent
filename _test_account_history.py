@@ -104,6 +104,17 @@ start = datetime(2026, 10, 2, tzinfo=timezone.utc)
 check([t["position_id"] for t in h.trades(start=start)] == [101], "date filter on close time")
 
 print("\n" + "=" * 70)
+print("TEST 5b: commission rates per symbol")
+print("=" * 70)
+# 0.1 lot × 100 000 × 1.1000 = 11 000 $ notional; 0.70 $ round trip → 0.35 $/side
+rates = h.commission_rates(lambda s: 100_000.0, min_trades=1)
+eur = rates.get("EURUSD")
+check(eur is not None and abs(eur["rate_per_side"] - 0.70 / 2 / 11_000) < 1e-9,
+      f"EURUSD rate per side = 0.35 $ / 11 000 $ → {eur and eur['rate_per_side']:.8f}")
+check(eur is not None and eur["per_lot_round_trip"] == 7.0, "7 $ per lot round trip (0.70 $ for 0.1 lot)")
+check(h.commission_rates(lambda s: 100_000.0) == {}, "fewer than 3 trades → no measured rate (fallback)")
+
+print("\n" + "=" * 70)
 print("TEST 6: summary")
 print("=" * 70)
 s = h.summary()
